@@ -179,9 +179,11 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.test_state_file = os.path.join(self.tmp_dir.name, "test_state.json")
+        self._original_state_file = checker.STATE_FILE
         checker.STATE_FILE = self.test_state_file
 
     def tearDown(self):
+        checker.STATE_FILE = self._original_state_file
         self.tmp_dir.cleanup()
 
     def test_routine_unavailable_run_does_not_modify_state_file(self):
@@ -206,8 +208,8 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
         with open(self.test_state_file, "r", encoding="utf-8") as f:
             self.assertEqual(json.load(f), initial)
 
-    def test_error_status_preserves_notified_flag_and_does_not_save(self):
-        """Scrape ERROR does NOT clear notified=True and does NOT modify state.json."""
+    def test_hard_error_preserves_state_and_fails_the_run(self):
+        """A hard ERROR (Cloudflare block) keeps state AND exits non-zero so Actions goes red."""
         initial = {"notified": True, "last_status": "available"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
@@ -220,11 +222,37 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
             "unavailable_signals": [],
             "page_title": "Attention Required! | Cloudflare",
             "error_reason": "Cloudflare challenge block",
+            "hard": True,
         }):
-            checker.main([])
+            with self.assertRaises(SystemExit) as ctx:
+                checker.main([])
 
-        mtime_after = os.path.getmtime(self.test_state_file)
-        self.assertEqual(mtime_before, mtime_after)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(mtime_before, os.path.getmtime(self.test_state_file))
+        with open(self.test_state_file, "r", encoding="utf-8") as f:
+            after = json.load(f)
+        self.assertTrue(after["notified"])
+        self.assertEqual(after["last_status"], "available")
+
+    def test_soft_error_preserves_state_and_keeps_the_run_green(self):
+        """A transient ERROR (timeout) keeps state and must NOT fail the run."""
+        initial = {"notified": True, "last_status": "available"}
+        with open(self.test_state_file, "w", encoding="utf-8") as f:
+            json.dump(initial, f)
+        mtime_before = os.path.getmtime(self.test_state_file)
+
+        with patch.object(checker, "check_availability", return_value={
+            "status": "ERROR",
+            "available": False,
+            "signals_found": [],
+            "unavailable_signals": [],
+            "page_title": "Timeout",
+            "error_reason": "Navigation timeout",
+            "hard": False,
+        }):
+            checker.main([])  # must not raise SystemExit
+
+        self.assertEqual(mtime_before, os.path.getmtime(self.test_state_file))
         with open(self.test_state_file, "r", encoding="utf-8") as f:
             after = json.load(f)
         self.assertTrue(after["notified"])
@@ -250,6 +278,32 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
             after = json.load(f)
         self.assertFalse(after["notified"])
         self.assertEqual(after["last_status"], "unavailable")
+
+
+class TestUserAgentNormalisation(unittest.TestCase):
+    """Unit tests for normalize_user_agent(), which keeps the UA in step with the browser."""
+
+    def test_headless_marker_is_removed(self):
+        """'HeadlessChrome' is an automation tell and must be rewritten to 'Chrome'."""
+        raw = (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+            "HeadlessChrome/141.0.0.0 Safari/537.36"
+        )
+        ua = checker.normalize_user_agent(raw)
+        self.assertNotIn("Headless", ua)
+        self.assertIn("Chrome/141.0.0.0", ua)
+
+    def test_plain_chrome_user_agent_is_left_alone(self):
+        raw = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+        )
+        self.assertEqual(checker.normalize_user_agent(raw), raw)
+
+    def test_empty_or_missing_probe_falls_back_to_default(self):
+        self.assertEqual(checker.normalize_user_agent(""), checker.DEFAULT_USER_AGENT)
+        self.assertEqual(checker.normalize_user_agent("   "), checker.DEFAULT_USER_AGENT)
+        self.assertEqual(checker.normalize_user_agent(None), checker.DEFAULT_USER_AGENT)
 
 
 if __name__ == "__main__":

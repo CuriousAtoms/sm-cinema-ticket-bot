@@ -1,0 +1,27 @@
+name: Tests
+
+# The decision logic is a pure function with no browser dependency, so this runs
+# in seconds and needs no pip install at all — checker.py imports Playwright
+# lazily, inside check_availability().
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run unit tests
+        run: python -m unittest discover -v

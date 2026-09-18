@@ -74,6 +74,29 @@ UNAVAILABLE_SIGNALS = [
     "tickets not yet available",
 ]
 
+# Fallback user agent, used only if the browser will not report its own.
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def normalize_user_agent(raw_ua):
+    """
+    Turn the bundled Chromium's own user agent into a plausible desktop one.
+
+    Headless builds announce themselves as "HeadlessChrome", an obvious automation
+    tell. Deriving the string from the browser instead of hardcoding it means the
+    claimed Chrome version can never drift away from the real one — a stale version
+    is itself something bot detection scores against you.
+    """
+    ua = (raw_ua or "").strip()
+    if not ua:
+        return DEFAULT_USER_AGENT
+    return ua.replace("HeadlessChrome", "Chrome")
+
+
 # Cloudflare challenge indicators: title and body signatures that confirm a block page
 CLOUDFLARE_TITLE_MARKERS = [
     "just a moment",
@@ -107,6 +130,27 @@ def check_cloudflare_challenge(page_title: str, body_text: str) -> bool:
         return True
 
     return False
+
+
+def error_result(reason, page_title="Error", hard=False):
+    """
+    Build an ERROR result.
+
+    `hard` marks failures meaning the bot is blind rather than merely unlucky:
+    blocked by Cloudflare, misconfigured, or reading a page it no longer
+    understands. Hard failures exit non-zero so the Actions run goes red and
+    GitHub emails you, instead of looking identical to "no tickets yet".
+    Transient hiccups (a timeout, a half-rendered page) stay green.
+    """
+    return {
+        "status": "ERROR",
+        "available": False,
+        "signals_found": [],
+        "unavailable_signals": [],
+        "page_title": page_title,
+        "error_reason": reason,
+        "hard": hard,
+    }
 
 
 # ── Decision Logic ─────────────────────────────────────────────────────────────
@@ -249,14 +293,7 @@ def check_availability():
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
     except ImportError:
         print("[ERROR] Playwright is not installed. Run: pip install playwright && playwright install chromium")
-        return {
-            "status": "ERROR",
-            "available": False,
-            "signals_found": [],
-            "unavailable_signals": [],
-            "page_title": "Playwright Not Installed",
-            "error_reason": "Playwright library missing",
-        }
+        return error_result("Playwright library missing", page_title="Playwright Not Installed", hard=True)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -269,12 +306,21 @@ def check_availability():
             ],
         )
 
+        # Ask the bundled Chromium what it calls itself, rather than asserting a
+        # version that silently rots as the pinned Playwright release ages.
+        user_agent = DEFAULT_USER_AGENT
+        try:
+            probe_context = browser.new_context()
+            user_agent = normalize_user_agent(
+                probe_context.new_page().evaluate("() => navigator.userAgent")
+            )
+            probe_context.close()
+        except Exception as e:
+            print(f"[WARN] Could not read the browser user agent ({e}); using fallback.")
+        print(f"[CHECK] User agent: {user_agent}")
+
         context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            user_agent=user_agent,
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
             timezone_id=TIMEZONE,
@@ -292,26 +338,12 @@ def check_availability():
                 response = page.goto(MOVIE_URL, wait_until="domcontentloaded", timeout=35000)
             except PlaywrightTimeout:
                 print("[ERROR] Page navigation timed out.")
-                return {
-                    "status": "ERROR",
-                    "available": False,
-                    "signals_found": [],
-                    "unavailable_signals": [],
-                    "page_title": "Timeout",
-                    "error_reason": "Navigation timeout",
-                }
+                return error_result("Navigation timeout", page_title="Timeout", hard=False)
 
             # Check HTTP status
             if response and response.status >= 400:
                 print(f"[ERROR] HTTP error {response.status}")
-                return {
-                    "status": "ERROR",
-                    "available": False,
-                    "signals_found": [],
-                    "unavailable_signals": [],
-                    "page_title": f"HTTP {response.status}",
-                    "error_reason": f"HTTP status {response.status}",
-                }
+                return error_result(f"HTTP status {response.status}", page_title=f"HTTP {response.status}", hard=True)
 
             # Allow time for SPA hydration (Lumos web app)
             page.wait_for_timeout(4000)
@@ -323,26 +355,12 @@ def check_availability():
             body_text = page.inner_text("body")
             if check_cloudflare_challenge(page_title, body_text):
                 print(f"[ERROR] Cloudflare challenge detected! Access blocked (Title: '{page_title}').")
-                return {
-                    "status": "ERROR",
-                    "available": False,
-                    "signals_found": [],
-                    "unavailable_signals": [],
-                    "page_title": page_title,
-                    "error_reason": "Cloudflare challenge block",
-                }
+                return error_result("Cloudflare challenge block", page_title=page_title, hard=True)
 
             # Verify the page contains meaningful content
             if len(body_text.strip()) < 150:
                 print("[ERROR] Page content too short; dynamic content failed to render.")
-                return {
-                    "status": "ERROR",
-                    "available": False,
-                    "signals_found": [],
-                    "unavailable_signals": [],
-                    "page_title": page_title,
-                    "error_reason": "Incomplete page render",
-                }
+                return error_result("Incomplete page render", page_title=page_title, hard=False)
 
             # Scoped evaluation of main movie content
             scraped = page.evaluate("""() => {
@@ -418,29 +436,17 @@ def check_availability():
                 "unavailable_signals": found_unavailable,
                 "page_title": page_title,
                 "error_reason": error_reason,
+                # Detection drift: the page loaded but matched nothing we know.
+                "hard": (status == "ERROR"),
             }
 
         except PlaywrightTimeout:
             print("[ERROR] Page operation timed out.")
-            return {
-                "status": "ERROR",
-                "available": False,
-                "signals_found": [],
-                "unavailable_signals": [],
-                "page_title": "Timeout",
-                "error_reason": "Playwright operation timeout",
-            }
+            return error_result("Playwright operation timeout", page_title="Timeout", hard=False)
 
         except Exception as e:
             print(f"[ERROR] Unexpected error during scraping: {e}")
-            return {
-                "status": "ERROR",
-                "available": False,
-                "signals_found": [],
-                "unavailable_signals": [],
-                "page_title": "Error",
-                "error_reason": str(e),
-            }
+            return error_result(str(e), page_title="Error", hard=False)
 
         finally:
             browser.close()
@@ -584,6 +590,14 @@ def main(argv=None):
     if status == "ERROR":
         print(f"\n[ACTION] Scrape resulted in ERROR ({result.get('error_reason')}).")
         print("[ACTION] Preserving existing notification state. No state changes saved.")
+        if result.get("hard"):
+            # Blocked, misconfigured, or no longer able to read the page: fail the
+            # run so Actions shows red and GitHub emails, instead of a green tick
+            # that is indistinguishable from "no tickets yet".
+            print("[ACTION] Hard failure — exiting non-zero so this run shows as failed.")
+            print("\n" + "=" * 60 + "\n")
+            sys.exit(1)
+        print("[ACTION] Transient failure — this run stays green.")
         print(f"\n{'='*60}\n")
         return
 

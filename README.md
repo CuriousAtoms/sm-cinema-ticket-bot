@@ -8,12 +8,14 @@ An automated ticket availability monitor for **Avengers: Doomsday** at **SM Cine
 
 - **Automated Monitoring:** Runs every 5 minutes on GitHub Actions.
 - **Client-Side Rendering Support:** Uses headless Playwright (Chromium) to handle JavaScript SPA hydration.
-- **Anti-Bot & Evasion Protections:** Masks `navigator.webdriver` and sets realistic viewport, locale, and user agents to avoid Cloudflare bot blocking.
+- **Anti-Bot & Evasion Protections:** Masks `navigator.webdriver` and sets a realistic viewport and locale. The user agent is read from the bundled Chromium at runtime (with `HeadlessChrome` rewritten to `Chrome`) so the claimed browser version can never drift out of step with the real one.
 - **Three-State Detection:** Every check resolves to `AVAILABLE`, `UNAVAILABLE`, or `ERROR`. A timeout, HTTP error, Cloudflare challenge, or unrecognisable page is an `ERROR` — never a confident "no tickets yet".
 - **Scoped Signal Matching:** Reads the film status badge and buttons inside the film-details region only, so site-wide navigation and footer links cannot trigger a false alarm. Showtime elements must contain a digit to count as a real session.
 - **Detection Drift Guard:** If a page loads fine but matches no known availability *or* unavailability markers, the run is reported as `ERROR` rather than silently assuming tickets aren't out.
 - **Duplicate Prevention:** Alert status is tracked in `state.json`, which is committed back to the repository **only when the status actually changes** — routine checks write nothing.
 - **Schedule Keepalive:** A monthly empty commit stops GitHub from auto-disabling the cron after 60 days of repository inactivity.
+- **Loud Failures:** A block, a misconfiguration, or a page the bot can no longer read exits non-zero, so the Actions run turns red and GitHub emails you. Transient timeouts stay green and are simply retried on the next tick.
+- **Tested:** The decision logic is a pure function covered by a unit suite that runs on every push.
 - **Zero Cost:** 100% free with no credit card required.
 
 ---
@@ -88,10 +90,11 @@ python checker.py
 | Showtime session elements containing a time | `AVAILABLE` |
 | Status badge reads `now showing` / `advance tickets` / `tickets on sale` | `AVAILABLE` |
 | Status badge or page text says `coming soon` and no booking CTA is present | `UNAVAILABLE` |
-| Cloudflare challenge, HTTP error, timeout, or blank render | `ERROR` — state untouched |
-| Page loads but matches nothing recognisable | `ERROR` — detection drift |
+| Cloudflare challenge or HTTP error | `ERROR` (hard) — run fails, state untouched |
+| Page loads but matches nothing recognisable | `ERROR` (hard) — detection drift, run fails |
+| Timeout or blank render | `ERROR` (soft) — run stays green, state untouched |
 
-`ERROR` never resets the notification flag and never writes state, so a temporary block cannot cause a repeat alert.
+`ERROR` never resets the notification flag and never writes state, so a temporary block cannot cause a repeat alert. **Hard** errors mean the bot is blind rather than unlucky, so they fail the workflow run deliberately — a green tick should only ever mean "checked successfully, no tickets yet".
 
 ---
 
@@ -102,7 +105,8 @@ python checker.py
 ├── .github/
 │   └── workflows/
 │       ├── check.yml       # 5-minute cron scheduler
-│       └── keepalive.yml   # Monthly commit so the cron is not auto-disabled
+│       ├── keepalive.yml   # Monthly commit so the cron is not auto-disabled
+│       └── tests.yml       # Unit tests on every push
 ├── .gitignore              # Ignored files
 ├── checker.py              # Scraper, decision logic & Discord notifier
 ├── test_checker.py         # Unit tests for the decision logic (stdlib unittest)
