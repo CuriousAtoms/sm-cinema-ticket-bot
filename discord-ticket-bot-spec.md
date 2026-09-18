@@ -1,6 +1,12 @@
 # Discord Ticket Availability Notification Bot
 ### SM Cinema × Avengers: Doomsday × GitHub Actions (Free, Zero Cost)
 
+> **Historical design document.** This is the original specification the project was
+> built from. The implementation has since moved on — notably the state file shape,
+> the signal lists, and the three-state (`AVAILABLE` / `UNAVAILABLE` / `ERROR`)
+> decision logic. Treat `checker.py` and `README.md` as the source of truth.
+
+
 ---
 
 ## Table of Contents
