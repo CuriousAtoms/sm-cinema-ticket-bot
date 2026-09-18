@@ -306,5 +306,313 @@ class TestUserAgentNormalisation(unittest.TestCase):
         self.assertEqual(checker.normalize_user_agent(None), checker.DEFAULT_USER_AGENT)
 
 
+class TestEvaluateAvailability(unittest.TestCase):
+    """
+    Unit tests for the PROVISIONAL evaluate_availability() function evaluating API payloads.
+    NOTE: These tests verify the interim decision rule and MUST be revisited once the real
+    on-sale category enum values are confirmed.
+    """
+
+    # Verbatim real payload observed for Avengers: Doomsday
+    REAL_PAYLOAD_COMING_SOON = {
+        "filmAvailability": {
+            "filmId": "HO00001619",
+            "siteId": None,
+            "categories": ["ComingSoon"],
+            "showtimeAttributeIds": [],
+            "advanceBookingPeriods": [],
+        },
+        "relatedData": {"attributes": []},
+    }
+
+    def test_interim_rule_coming_soon_unavail(self):
+        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
+        # categories == ["ComingSoon"], empty advanceBookingPeriods, empty showtimeAttributeIds -> UNAVAILABLE
+        avail = self.REAL_PAYLOAD_COMING_SOON["filmAvailability"]
+        status, found_avail, found_unavail, err = checker.evaluate_availability(avail)
+        self.assertEqual(status, "UNAVAILABLE")
+        self.assertEqual(found_avail, [])
+        self.assertTrue(any("ComingSoon" in u for u in found_unavail))
+        self.assertIsNone(err)
+
+    def test_interim_rule_advance_booking_periods_available(self):
+        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
+        # advanceBookingPeriods is non-empty -> AVAILABLE
+        avail = {
+            "filmId": "HO00001619",
+            "siteId": None,
+            "categories": ["ComingSoon"],
+            "showtimeAttributeIds": [],
+            "advanceBookingPeriods": [{"periodId": "ADV01", "name": "Early Bird"}],
+        }
+        status, found_avail, found_unavail, err = checker.evaluate_availability(avail)
+        self.assertEqual(status, "AVAILABLE")
+        self.assertTrue(any("advanceBookingPeriods" in a for a in found_avail))
+        self.assertEqual(found_unavail, [])
+        self.assertIsNone(err)
+
+    def test_interim_rule_showtime_attribute_ids_available(self):
+        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
+        # showtimeAttributeIds is non-empty -> AVAILABLE
+        avail = {
+            "filmId": "HO00001619",
+            "siteId": None,
+            "categories": ["ComingSoon"],
+            "showtimeAttributeIds": ["ATTR_IMAX_3D"],
+            "advanceBookingPeriods": [],
+        }
+        status, found_avail, found_unavail, err = checker.evaluate_availability(avail)
+        self.assertEqual(status, "AVAILABLE")
+        self.assertTrue(any("showtimeAttributeIds" in a for a in found_avail))
+        self.assertEqual(found_unavail, [])
+        self.assertIsNone(err)
+
+    def test_interim_rule_categories_without_coming_soon_available(self):
+        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
+        # categories is non-empty and contains no "ComingSoon" -> AVAILABLE
+        avail = {
+            "filmId": "HO00001619",
+            "siteId": None,
+            "categories": ["NowShowing"],
+            "showtimeAttributeIds": [],
+            "advanceBookingPeriods": [],
+        }
+        status, found_avail, found_unavail, err = checker.evaluate_availability(avail)
+        self.assertEqual(status, "AVAILABLE")
+        self.assertTrue(any("NowShowing" in a for a in found_avail))
+        self.assertEqual(found_unavail, [])
+        self.assertIsNone(err)
+
+    def test_interim_rule_empty_categories_error(self):
+        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
+        # categories list is empty -> ERROR
+        avail = {
+            "filmId": "HO00001619",
+            "siteId": None,
+            "categories": [],
+            "showtimeAttributeIds": [],
+            "advanceBookingPeriods": [],
+        }
+        status, found_avail, found_unavail, err = checker.evaluate_availability(avail)
+        self.assertEqual(status, "ERROR")
+        self.assertIn("empty", err.lower())
+
+    def test_interim_rule_missing_key_or_invalid_shape_error(self):
+        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
+        # Missing categories or non-dict input -> ERROR
+        status1, _, _, err1 = checker.evaluate_availability({"filmId": "HO00001619"})
+        self.assertEqual(status1, "ERROR")
+        self.assertIn("categories", err1.lower())
+
+        status2, _, _, err2 = checker.evaluate_availability(None)
+        self.assertEqual(status2, "ERROR")
+
+        status3, _, _, err3 = checker.evaluate_availability("not a dict")
+        self.assertEqual(status3, "ERROR")
+
+
+class TestTokenAndFilmIdExtraction(unittest.TestCase):
+    """Unit tests for URL film ID extraction and __NEXT_DATA__ token parsing."""
+
+    def test_extract_film_id(self):
+        self.assertEqual(
+            checker.extract_film_id("https://www.smcinema.com/films/Avengers-Doomsday/HO00001619"),
+            "HO00001619",
+        )
+        self.assertEqual(
+            checker.extract_film_id("https://www.smcinema.com/films/Avengers-Doomsday/HO00001619/"),
+            "HO00001619",
+        )
+        self.assertEqual(checker.extract_film_id("HO00001619"), "HO00001619")
+        self.assertEqual(checker.extract_film_id(""), "")
+
+    def test_extract_gas_token_success(self):
+        html = """
+        <html>
+        <head><title>Avengers: Doomsday</title></head>
+        <body>
+        <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"environment":{"gasToken":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy.signature"}}}}
+        </script>
+        </body>
+        </html>
+        """
+        token = checker.extract_gas_token(html)
+        self.assertEqual(token, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy.signature")
+
+    def test_extract_gas_token_missing_script(self):
+        html = "<html><body>No Next.js script here</body></html>"
+        self.assertIsNone(checker.extract_gas_token(html))
+
+    def test_extract_gas_token_missing_token_key(self):
+        html = '<script id="__NEXT_DATA__" type="application/json">{"props":{}}</script>'
+        self.assertIsNone(checker.extract_gas_token(html))
+
+    def test_extract_gas_token_malformed_json(self):
+        html = '<script id="__NEXT_DATA__" type="application/json">{invalid json}</script>'
+        self.assertIsNone(checker.extract_gas_token(html))
+
+
+class MockResponse:
+    def __init__(self, status_code, text="", json_data=None):
+        self.status_code = status_code
+        self.text = text
+        self._json_data = json_data
+
+    def json(self):
+        if self._json_data is not None:
+            return self._json_data
+        raise ValueError("No JSON")
+
+
+class TestApiFailureClassification(unittest.TestCase):
+    """
+    Unit tests for Task 4 failure classifications:
+      page fetch 403 or 429                     -> soft (Cloudflare throttle)
+      page fetch 5xx, timeout, connection error -> soft
+      page fetch 404                            -> hard (film URL is wrong/gone)
+      __NEXT_DATA__ missing, or gasToken absent -> hard (page structure changed)
+      API 401/403                               -> hard (token flow changed)
+      API 200 but no filmAvailability key       -> hard (schema drift)
+      API 5xx or timeout                        -> soft
+    """
+
+    VALID_HTML = """
+    <html><head><title>Avengers</title></head><body>
+    <script id="__NEXT_DATA__" type="application/json">
+    {"props":{"pageProps":{"environment":{"gasToken":"valid_token_12345"}}}}
+    </script>
+    </body></html>
+    """
+
+    def test_page_fetch_403_is_soft(self):
+        session = unittest.mock.MagicMock()
+        session.get.return_value = MockResponse(403, "Access Denied")
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertFalse(res["hard"])
+        self.assertIn("Cloudflare", res["error_reason"])
+
+    def test_page_fetch_429_is_soft(self):
+        session = unittest.mock.MagicMock()
+        session.get.return_value = MockResponse(429, "Too Many Requests")
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertFalse(res["hard"])
+
+    def test_page_fetch_5xx_is_soft(self):
+        session = unittest.mock.MagicMock()
+        session.get.return_value = MockResponse(502, "Bad Gateway")
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertFalse(res["hard"])
+
+    def test_page_fetch_timeout_is_soft(self):
+        session = unittest.mock.MagicMock()
+        session.get.side_effect = checker.RequestTimeout("Connection timed out")
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertFalse(res["hard"])
+
+    def test_page_fetch_404_is_hard(self):
+        session = unittest.mock.MagicMock()
+        session.get.return_value = MockResponse(404, "Not Found")
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertTrue(res["hard"])
+        self.assertIn("404", res["error_reason"])
+
+    def test_next_data_missing_is_hard(self):
+        session = unittest.mock.MagicMock()
+        session.get.return_value = MockResponse(200, "<html><body>No script</body></html>")
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertTrue(res["hard"])
+        self.assertIn("gasToken absent", res["error_reason"])
+
+    def test_api_401_or_403_is_hard(self):
+        session = unittest.mock.MagicMock()
+        # Page returns 200 with valid token, but API returns 401
+        session.get.side_effect = [
+            MockResponse(200, self.VALID_HTML),
+            MockResponse(401, "Unauthorized"),
+        ]
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertTrue(res["hard"])
+        self.assertIn("authorization", res["error_reason"].lower())
+
+    def test_api_200_missing_film_availability_key_is_hard(self):
+        session = unittest.mock.MagicMock()
+        session.get.side_effect = [
+            MockResponse(200, self.VALID_HTML),
+            MockResponse(200, json_data={"unexpectedKey": 123}),
+        ]
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertTrue(res["hard"])
+        self.assertIn("schema drift", res["error_reason"].lower())
+
+    def test_api_5xx_is_soft(self):
+        session = unittest.mock.MagicMock()
+        session.get.side_effect = [
+            MockResponse(200, self.VALID_HTML),
+            MockResponse(500, "Internal Server Error"),
+        ]
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertFalse(res["hard"])
+
+    def test_api_timeout_is_soft(self):
+        session = unittest.mock.MagicMock()
+        session.get.side_effect = [
+            MockResponse(200, self.VALID_HTML),
+            checker.RequestTimeout("API timeout"),
+        ]
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertFalse(res["hard"])
+
+
+class TestApiRetryAndDispatcher(unittest.TestCase):
+    """Unit tests for retrying soft failures, aborting on hard failures, and fallback dispatching."""
+
+    def test_retries_on_soft_failure_and_succeeds(self):
+        soft_err = checker.error_result("Cloudflare throttle", hard=False)
+        success = {"status": "UNAVAILABLE", "available": False, "signals_found": [], "unavailable_signals": []}
+
+        with patch.object(checker, "_check_availability_api_single", side_effect=[soft_err, soft_err, success]) as mock_single:
+            res = checker.check_availability_api(retry_backoffs=(0, 0, 0))
+            self.assertEqual(res["status"], "UNAVAILABLE")
+            self.assertEqual(mock_single.call_count, 3)
+
+    def test_aborts_immediately_on_hard_failure(self):
+        hard_err = checker.error_result("404 Not Found", hard=True)
+
+        with patch.object(checker, "_check_availability_api_single", return_value=hard_err) as mock_single:
+            res = checker.check_availability_api(retry_backoffs=(0, 0, 0))
+            self.assertEqual(res["status"], "ERROR")
+            self.assertTrue(res["hard"])
+            self.assertEqual(mock_single.call_count, 1)
+
+    def test_dispatcher_defaults_to_api(self):
+        with patch.dict(os.environ, {"USE_BROWSER_FALLBACK": "0"}), \
+             patch.object(checker, "check_availability_api", return_value={"status": "API"}) as mock_api, \
+             patch.object(checker, "check_availability_browser", return_value={"status": "BROWSER"}) as mock_browser:
+            res = checker.check_availability()
+            self.assertEqual(res["status"], "API")
+            mock_api.assert_called_once()
+            mock_browser.assert_not_called()
+
+    def test_dispatcher_uses_browser_when_enabled(self):
+        with patch.dict(os.environ, {"USE_BROWSER_FALLBACK": "1"}), \
+             patch.object(checker, "check_availability_api", return_value={"status": "API"}) as mock_api, \
+             patch.object(checker, "check_availability_browser", return_value={"status": "BROWSER"}) as mock_browser:
+            res = checker.check_availability()
+            self.assertEqual(res["status"], "BROWSER")
+            mock_browser.assert_called_once()
+            mock_api.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
