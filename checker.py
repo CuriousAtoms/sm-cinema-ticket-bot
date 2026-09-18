@@ -7,6 +7,7 @@ Runs on GitHub Actions on a schedule or locally.
 import os
 import sys
 import json
+import copy
 import argparse
 from datetime import datetime, timezone, timedelta
 
@@ -32,7 +33,6 @@ def get_manila_now():
             return datetime.now(pht)
 
 
-
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 MOVIE_URL = os.environ.get(
@@ -44,15 +44,25 @@ MENTION = os.environ.get("MENTION", "")  # e.g. "@everyone" or "<@&ROLE_ID>"
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Manila")
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 
-# Primary signals that indicate tickets are ready for booking
+# Availability signals (status badges or direct action keywords)
 AVAILABILITY_SIGNALS = [
+    "now showing",
+    "advance tickets",
+    "tickets on sale",
     "book now",
     "buy tickets",
-    "get tickets",
     "buy now",
-    "select showtime",
-    "select cinema",
-    "select date",
+    "get tickets",
+    "select seats",
+]
+
+# Explicit action button phrases that confirm ticket booking is open
+BOOKING_BUTTON_PHRASES = [
+    "book now",
+    "buy tickets",
+    "buy now",
+    "get tickets",
+    "select seats",
 ]
 
 # Signals indicating tickets are not yet released
@@ -60,8 +70,18 @@ UNAVAILABLE_SIGNALS = [
     "coming soon",
     "no screenings",
     "tickets not yet available",
-    "advance tickets",
 ]
+
+# Cloudflare challenge indicators
+CLOUDFLARE_MARKERS = [
+    "just a moment",
+    "cloudflare",
+    "turnstile",
+    "verify you are human",
+    "challenge-running",
+    "attention required",
+]
+
 
 # ── State Management ───────────────────────────────────────────────────────────
 
@@ -70,17 +90,27 @@ def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                return {
+                    "notified": bool(data.get("notified", False)),
+                    "last_status": data.get("last_status", "unavailable"),
+                }
         except Exception as e:
             print(f"[STATE] Error loading {STATE_FILE}: {e}. Initializing fresh state.")
-    return {"notified": False, "last_check": None, "last_status": None}
+    return {"notified": False, "last_status": "unavailable"}
 
 
 def save_state(state):
-    """Save the updated state back to disk."""
+    """Save the state back to disk."""
     try:
+        # Keep only meaningful fields to prevent spurious diffs
+        payload = {
+            "notified": bool(state.get("notified", False)),
+            "last_status": state.get("last_status", "unavailable"),
+        }
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
+            json.dump(payload, f, indent=2)
+            f.write("\n")
     except Exception as e:
         print(f"[STATE] Error saving {STATE_FILE}: {e}")
 
@@ -92,7 +122,12 @@ def check_availability():
     Launch headless Chromium, load the SM Cinema page, wait for JavaScript rendering,
     and inspect the page for ticket availability signals.
 
-    Returns dict with availability details.
+    Distinguishes:
+      - "AVAILABLE": Page loaded successfully and tickets are available.
+      - "UNAVAILABLE": Page loaded successfully and confirmed tickets are not available.
+      - "ERROR": Scraping failed, timed out, or encountered Cloudflare challenges.
+
+    Returns dict with status, availability bool, and signals found.
     """
     print(f"[CHECK] Loading page: {MOVIE_URL}")
 
@@ -100,7 +135,14 @@ def check_availability():
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
     except ImportError:
         print("[ERROR] Playwright is not installed. Run: pip install playwright && playwright install chromium")
-        return {"available": False, "signals_found": [], "page_title": "Playwright Not Installed"}
+        return {
+            "status": "ERROR",
+            "available": False,
+            "signals_found": [],
+            "unavailable_signals": [],
+            "page_title": "Playwright Not Installed",
+            "error_reason": "Playwright library missing",
+        }
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -133,72 +175,196 @@ def check_availability():
 
         try:
             try:
-                page.goto(MOVIE_URL, wait_until="networkidle", timeout=35000)
+                response = page.goto(MOVIE_URL, wait_until="domcontentloaded", timeout=35000)
             except PlaywrightTimeout:
-                print("[WARN] networkidle timed out, waiting for load state...")
-                page.wait_for_load_state("load", timeout=10000)
+                print("[ERROR] Page navigation timed out.")
+                return {
+                    "status": "ERROR",
+                    "available": False,
+                    "signals_found": [],
+                    "unavailable_signals": [],
+                    "page_title": "Timeout",
+                    "error_reason": "Navigation timeout",
+                }
 
-            # Allow additional time for any dynamic SPA hydration
-            page.wait_for_timeout(3000)
+            # Check HTTP status
+            if response and response.status >= 400:
+                print(f"[ERROR] HTTP error {response.status}")
+                return {
+                    "status": "ERROR",
+                    "available": False,
+                    "signals_found": [],
+                    "unavailable_signals": [],
+                    "page_title": f"HTTP {response.status}",
+                    "error_reason": f"HTTP status {response.status}",
+                }
 
-            page_title = page.title()
+            # Allow time for SPA hydration (Lumos web app)
+            page.wait_for_timeout(4000)
+
+            page_title = (page.title() or "").strip()
             print(f"[CHECK] Page title: {page_title}")
 
-            # Extract content from main content container or fallback to body
-            # Exclude header and nav elements where generic links like "Now Showing" live
-            content_text = page.evaluate("""() => {
-                const header = document.querySelector('header');
-                const nav = document.querySelector('nav');
+            # Check for Cloudflare challenge / Turnstile page
+            body_text = page.inner_text("body").lower()
+            if any(marker in body_text or marker in page_title.lower() for marker in CLOUDFLARE_MARKERS):
+                # Ensure it is genuinely a challenge rather than normal mention
+                if "verify you are human" in body_text or "just a moment" in page_title.lower() or "challenge-running" in body_text:
+                    print("[ERROR] Cloudflare challenge detected! Access blocked.")
+                    return {
+                        "status": "ERROR",
+                        "available": False,
+                        "signals_found": [],
+                        "unavailable_signals": [],
+                        "page_title": page_title,
+                        "error_reason": "Cloudflare challenge block",
+                    }
+
+            # Verify the page contains meaningful content
+            if len(body_text) < 150:
+                print("[ERROR] Page content too short; dynamic content failed to render.")
+                return {
+                    "status": "ERROR",
+                    "available": False,
+                    "signals_found": [],
+                    "unavailable_signals": [],
+                    "page_title": page_title,
+                    "error_reason": "Incomplete page render",
+                }
+
+            # Scoped evaluation of main movie content
+            scraped = page.evaluate("""() => {
+                // 1. Check film status badge (e.g. .v-film-status)
+                const statusEl = document.querySelector('.v-film-status');
+                const filmStatus = statusEl ? statusEl.innerText.trim().toLowerCase() : '';
+
+                // 2. Buttons in main film content (exclude site header, footer, loyalty modal)
+                const contentButtons = Array.from(
+                    document.querySelectorAll(
+                        '.v-film-details-banner button, .v-showtime-picker button, [class*="film-details"] button'
+                    )
+                ).map(b => (b.innerText || '').trim().toLowerCase()).filter(t => t.length > 0);
+
+                // 3. Active session or showtime elements
+                const sessionElements = Array.from(
+                    document.querySelectorAll(
+                        '[class*="session-button"], [data-session-id], [class*="showtime-time"], .v-session-picker'
+                    )
+                ).map(s => (s.innerText || '').trim().toLowerCase());
+
+                // 4. Cleaned page text (strip site-wide navigation, header, and footer)
                 const clone = document.body.cloneNode(true);
-                // Remove header and nav if found in clone to avoid false positives
-                const h = clone.querySelector('header');
-                if (h) h.remove();
-                const n = clone.querySelector('nav');
-                if (n) n.remove();
-                return clone.innerText.toLowerCase();
+                const removeSelectors = [
+                    'header',
+                    'footer',
+                    'nav',
+                    '.header-additional-menu',
+                    '.header-modal-and-button',
+                    '.header-loyalty-section'
+                ];
+                removeSelectors.forEach(sel => {
+                    clone.querySelectorAll(sel).forEach(el => el.remove());
+                });
+
+                return {
+                    filmStatus: filmStatus,
+                    contentButtons: contentButtons,
+                    sessionElements: sessionElements,
+                    cleanedText: clone.innerText.toLowerCase()
+                };
             }""")
 
-            print(f"[CHECK] Scanned content length: {len(content_text)} characters")
+            film_status = scraped["filmStatus"]
+            content_buttons = scraped["contentButtons"]
+            session_elements = scraped["sessionElements"]
+            cleaned_text = scraped["cleanedText"]
 
-            # Search for availability keywords
-            found_signals = [s for s in AVAILABILITY_SIGNALS if s in content_text]
-            found_unavailable = [s for s in UNAVAILABLE_SIGNALS if s in content_text]
+            print(f"[CHECK] Film status badge: '{film_status}'")
+            print(f"[CHECK] Content action buttons: {content_buttons}")
 
-            # Also check for explicit booking button or call-to-action elements
-            cta_buttons = page.query_selector_all(
-                "button, a.btn, a[class*='btn'], a[class*='book'], div[role='button']"
-            )
-            for btn in cta_buttons:
-                try:
-                    btn_text = (btn.inner_text() or "").strip().lower()
-                    for sig in ["book", "buy ticket", "select showtime", "get ticket"]:
-                        if sig in btn_text and sig not in found_signals:
-                            found_signals.append(f"button: {btn_text}")
-                except Exception:
-                    continue
+            found_available = []
+            found_unavailable = []
 
-            # Check if tickets are available
-            # Available if explicit availability signals exist
-            is_available = len(found_signals) > 0
+            # 1. Evaluate film status badge
+            if film_status:
+                if "coming soon" in film_status:
+                    found_unavailable.append(f"film-status badge: '{film_status}'")
+                for sig in ["now showing", "advance tickets", "tickets on sale", "book now"]:
+                    if sig in film_status:
+                        found_available.append(f"film-status badge: '{film_status}'")
 
-            print(f"[CHECK] Availability signals found: {found_signals}")
+            # 2. Evaluate unavailable signals in scoped text
+            for sig in UNAVAILABLE_SIGNALS:
+                if sig in cleaned_text and sig not in str(found_unavailable):
+                    found_unavailable.append(f"page text: '{sig}'")
+
+            # 3. Evaluate content buttons for booking actions
+            # Note: "view showtimes" and "add cinemas" are NOT booking buttons
+            has_booking_button = False
+            for btn in content_buttons:
+                for phrase in BOOKING_BUTTON_PHRASES:
+                    if phrase in btn:
+                        found_available.append(f"booking button: '{btn}'")
+                        has_booking_button = True
+
+            # 4. Evaluate active showtime sessions
+            if session_elements:
+                found_available.append(f"active sessions: {len(session_elements)} detected")
+
+            # 5. Evaluate availability keywords in cleaned body
+            for sig in ["now showing", "tickets on sale", "advance tickets"]:
+                if sig in cleaned_text and sig not in str(found_available):
+                    found_available.append(f"page text: '{sig}'")
+
+            # Decision Logic:
+            # - If strong unavailable signals exist (e.g. "coming soon"):
+            #   It is UNAVAILABLE unless an explicit booking CTA button is active.
+            # - Unavailable signals veto general keywords.
+            if found_unavailable:
+                if has_booking_button:
+                    is_available = True
+                    print("[CHECK] Booking button detected despite unavailable badge. Marked AVAILABLE.")
+                else:
+                    is_available = False
+                    print(f"[CHECK] Unavailable signals veto availability: {found_unavailable}")
+            else:
+                is_available = len(found_available) > 0
+
+            print(f"[CHECK] Availability signals found: {found_available}")
             print(f"[CHECK] Unavailability signals found: {found_unavailable}")
-            print(f"[CHECK] Conclusion: {'AVAILABLE ✅' if is_available else 'NOT YET ❌'}")
+            print(f"[CHECK] Conclusion: {'AVAILABLE ✅' if is_available else 'CONFIRMED UNAVAILABLE ❌'}")
 
+            status = "AVAILABLE" if is_available else "UNAVAILABLE"
             return {
+                "status": status,
                 "available": is_available,
-                "signals_found": found_signals,
+                "signals_found": found_available,
                 "unavailable_signals": found_unavailable,
                 "page_title": page_title,
+                "error_reason": None,
             }
 
         except PlaywrightTimeout:
-            print("[ERROR] Page timed out. SM Cinema may be slow or temporarily blocking.")
-            return {"available": False, "signals_found": [], "page_title": "Timeout"}
+            print("[ERROR] Page operation timed out.")
+            return {
+                "status": "ERROR",
+                "available": False,
+                "signals_found": [],
+                "unavailable_signals": [],
+                "page_title": "Timeout",
+                "error_reason": "Playwright operation timeout",
+            }
 
         except Exception as e:
             print(f"[ERROR] Unexpected error during scraping: {e}")
-            return {"available": False, "signals_found": [], "page_title": "Error"}
+            return {
+                "status": "ERROR",
+                "available": False,
+                "signals_found": [],
+                "unavailable_signals": [],
+                "page_title": "Error",
+                "error_reason": str(e),
+            }
 
         finally:
             browser.close()
@@ -266,7 +432,7 @@ def send_discord_notification(result, is_test=False):
                     },
                 ],
                 "footer": {
-                    "text": "SM Cinema Ticket Bot • Runs every 5 minutes via GitHub Actions"
+                    "text": "SM Cinema Ticket Bot • Runs via GitHub Actions"
                 },
                 "thumbnail": {
                     "url": "https://upload.wikimedia.org/wikipedia/en/9/98/Avengers_Doomsday_poster.jpg"
@@ -330,31 +496,50 @@ def main():
         return
 
     state = load_state()
-    print(f"[STATE] Already notified: {state.get('notified', False)}")
-    print(f"[STATE] Last check: {state.get('last_check', 'Never')}")
+    old_state = copy.deepcopy(state)
+
+    print(f"[STATE] Current status: {state.get('last_status')}")
+    print(f"[STATE] Already notified: {state.get('notified')}")
 
     result = check_availability()
+    status = result["status"]
 
-    state["last_check"] = now
-    state["last_status"] = "available" if result["available"] else "unavailable"
+    # 1. Handle scrape / network / Cloudflare errors
+    if status == "ERROR":
+        print(f"\n[ACTION] Scrape resulted in ERROR ({result.get('error_reason')}).")
+        print("[ACTION] Preserving existing notification state. No state changes saved.")
+        return
 
-    if result["available"]:
+    # 2. Genuine page reading obtained
+    previous_status = old_state.get("last_status", "unavailable")
+
+    if status == "AVAILABLE":
+        state["last_status"] = "available"
         if not state.get("notified", False):
-            print("\n[ACTION] 🎉 Tickets found for the first time! Sending notification...")
+            print("\n[ACTION] 🎉 Tickets confirmed available for the first time! Sending notification...")
             notified = send_discord_notification(result)
             if notified or not WEBHOOK_URL:
                 state["notified"] = True
         else:
             print("\n[ACTION] Tickets available, but notification was already sent. Skipping.")
-    else:
-        print("\n[ACTION] No tickets available yet.")
-        # If status went back to unavailable, reset notified flag so future re-releases alert
-        if state.get("notified") and state.get("last_status") == "unavailable":
+    else:  # UNAVAILABLE
+        state["last_status"] = "unavailable"
+        print("\n[ACTION] Confirmed: No tickets available yet.")
+        # Only reset notified flag if tickets were PREVIOUSLY confirmed available and have now disappeared
+        if state.get("notified", False) and previous_status == "available":
             state["notified"] = False
-            print("[STATE] Reset notified flag (tickets were previously marked unavailable).")
+            print("[STATE] Reset notified flag: Tickets were previously available but are now confirmed unavailable.")
 
-    save_state(state)
-    print(f"\n[STATE] Updated state: {state}")
+    # 3. Only persist state to disk if state actually changed
+    if (
+        state.get("notified") != old_state.get("notified")
+        or state.get("last_status") != old_state.get("last_status")
+    ):
+        save_state(state)
+        print(f"\n[STATE] Meaningful state change detected. Saved to {STATE_FILE}: {state}")
+    else:
+        print(f"\n[STATE] No state change ({state.get('last_status')}, notified={state.get('notified')}). Zero file modifications.")
+
     print(f"\n{'='*60}\n")
 
 
