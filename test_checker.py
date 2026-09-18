@@ -188,7 +188,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
 
     def test_routine_unavailable_run_does_not_modify_state_file(self):
         """A routine run with status 'unavailable' does NOT rewrite state.json."""
-        initial = {"notified": False, "last_status": "unavailable"}
+        initial = {"notify_phase": "none", "last_status": "unavailable"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
         mtime_before = os.path.getmtime(self.test_state_file)
@@ -210,7 +210,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
 
     def test_hard_error_preserves_state_and_fails_the_run(self):
         """A hard ERROR (Cloudflare block) keeps state AND exits non-zero so Actions goes red."""
-        initial = {"notified": True, "last_status": "available"}
+        initial = {"notify_phase": "open", "last_status": "available"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
         mtime_before = os.path.getmtime(self.test_state_file)
@@ -231,12 +231,12 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
         self.assertEqual(mtime_before, os.path.getmtime(self.test_state_file))
         with open(self.test_state_file, "r", encoding="utf-8") as f:
             after = json.load(f)
-        self.assertTrue(after["notified"])
+        self.assertEqual(after["notify_phase"], "open")
         self.assertEqual(after["last_status"], "available")
 
     def test_soft_error_preserves_state_and_keeps_the_run_green(self):
         """A transient ERROR (timeout) keeps state and must NOT fail the run."""
-        initial = {"notified": True, "last_status": "available"}
+        initial = {"notify_phase": "open", "last_status": "available"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
         mtime_before = os.path.getmtime(self.test_state_file)
@@ -255,12 +255,12 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
         self.assertEqual(mtime_before, os.path.getmtime(self.test_state_file))
         with open(self.test_state_file, "r", encoding="utf-8") as f:
             after = json.load(f)
-        self.assertTrue(after["notified"])
+        self.assertEqual(after["notify_phase"], "open")
         self.assertEqual(after["last_status"], "available")
 
-    def test_notified_resets_only_when_previously_available_and_now_unavailable(self):
-        """notified=True resets to False ONLY when transitioning available -> unavailable."""
-        initial = {"notified": True, "last_status": "available"}
+    def test_notify_phase_resets_only_when_previously_available_and_now_unavailable(self):
+        """notify_phase resets to 'none' ONLY when transitioning available -> unavailable."""
+        initial = {"notify_phase": "open", "last_status": "available"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
 
@@ -276,8 +276,188 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
 
         with open(self.test_state_file, "r", encoding="utf-8") as f:
             after = json.load(f)
-        self.assertFalse(after["notified"])
+        self.assertEqual(after["notify_phase"], "none")
         self.assertEqual(after["last_status"], "unavailable")
+
+    def test_legacy_state_migration(self):
+        """Legacy boolean 'notified' is migrated correctly on load, and save drops 'notified'."""
+        # Case 1: notified=True -> notify_phase="open"
+        with open(self.test_state_file, "w", encoding="utf-8") as f:
+            json.dump({"notified": True, "last_status": "available"}, f)
+        loaded = checker.load_state()
+        self.assertEqual(loaded["notify_phase"], "open")
+        self.assertEqual(loaded["last_status"], "available")
+
+        # Case 2: notified=False -> notify_phase="none"
+        with open(self.test_state_file, "w", encoding="utf-8") as f:
+            json.dump({"notified": False, "last_status": "unavailable"}, f)
+        loaded = checker.load_state()
+        self.assertEqual(loaded["notify_phase"], "none")
+        self.assertEqual(loaded["last_status"], "unavailable")
+
+        # Case 3: Invalid notify_phase defaults to "none"
+        with open(self.test_state_file, "w", encoding="utf-8") as f:
+            json.dump({"notify_phase": "invalid_value", "last_status": "unavailable"}, f)
+        loaded = checker.load_state()
+        self.assertEqual(loaded["notify_phase"], "none")
+
+        # Case 4: save_state only writes notify_phase and last_status
+        checker.save_state({"notify_phase": "announced", "last_status": "available", "notified": True, "extra": 123})
+        with open(self.test_state_file, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        self.assertEqual(saved, {"notify_phase": "announced", "last_status": "available"})
+        self.assertNotIn("notified", saved)
+        self.assertNotIn("extra", saved)
+
+    def test_determine_booking_phase(self):
+        """determine_booking_phase correctly classifies future startsAt vs past/none."""
+        # Future startsAt -> 'announced'
+        res_future = {"status": "AVAILABLE", "startsAt": "2099-12-01T15:00:00+08:00"}
+        self.assertEqual(checker.determine_booking_phase(res_future), "announced")
+
+        # Past startsAt -> 'open'
+        res_past = {"status": "AVAILABLE", "startsAt": "2020-01-01T10:00:00+08:00"}
+        self.assertEqual(checker.determine_booking_phase(res_past), "open")
+
+        # No startsAt -> 'open'
+        res_none = {"status": "AVAILABLE"}
+        self.assertEqual(checker.determine_booking_phase(res_none), "open")
+
+        # Invalid startsAt string -> 'open'
+        res_invalid = {"status": "AVAILABLE", "startsAt": "not-a-datetime"}
+        self.assertEqual(checker.determine_booking_phase(res_invalid), "open")
+
+    def test_two_phase_full_sequence_announce_then_open_then_skip(self):
+        """
+        Critical regression test:
+        1. Booking announced for future -> 1st notification sent, state='announced'.
+        2. Booking opens (startsAt in past/now) -> 2nd notification sent, state='open'.
+        3. Next run (still open) -> 0 notifications sent, zero file modifications.
+        """
+        initial = {"notify_phase": "none", "last_status": "unavailable"}
+        with open(self.test_state_file, "w", encoding="utf-8") as f:
+            json.dump(initial, f)
+
+        res_announce = {
+            "status": "AVAILABLE",
+            "available": True,
+            "signals_found": ["AdvanceBooking in categories"],
+            "unavailable_signals": [],
+            "startsAt": "2099-12-01T15:00:00+08:00",
+        }
+        res_open = {
+            "status": "AVAILABLE",
+            "available": True,
+            "signals_found": ["AdvanceBooking in categories"],
+            "unavailable_signals": [],
+            "startsAt": "2020-01-01T10:00:00+08:00",
+        }
+
+        with patch.object(checker, "send_discord_notification", return_value=True) as mock_notify:
+            # Run 1: Announced
+            with patch.object(checker, "check_availability", return_value=res_announce):
+                checker.main([])
+
+            self.assertEqual(mock_notify.call_count, 1)
+            with open(self.test_state_file, "r", encoding="utf-8") as f:
+                state1 = json.load(f)
+            self.assertEqual(state1, {"notify_phase": "announced", "last_status": "available"})
+
+            # Intermediate run: Still announced (future) -> should skip
+            mtime_before_skip1 = os.path.getmtime(self.test_state_file)
+            with patch.object(checker, "check_availability", return_value=res_announce):
+                checker.main([])
+
+            self.assertEqual(mock_notify.call_count, 1)  # unchanged
+            self.assertEqual(os.path.getmtime(self.test_state_file), mtime_before_skip1)
+
+            # Run 2: Booking opens now -> must notify again!
+            with patch.object(checker, "check_availability", return_value=res_open):
+                checker.main([])
+
+            self.assertEqual(mock_notify.call_count, 2)
+            with open(self.test_state_file, "r", encoding="utf-8") as f:
+                state2 = json.load(f)
+            self.assertEqual(state2, {"notify_phase": "open", "last_status": "available"})
+
+            # Run 3: Next run (still open) -> must skip and write nothing
+            mtime_before_skip2 = os.path.getmtime(self.test_state_file)
+            with patch.object(checker, "check_availability", return_value=res_open):
+                checker.main([])
+
+            self.assertEqual(mock_notify.call_count, 2)  # still 2!
+            self.assertEqual(os.path.getmtime(self.test_state_file), mtime_before_skip2)
+            with open(self.test_state_file, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), state2)
+
+    def test_straight_to_open_from_none(self):
+        """Tickets released straight to sale without prior announcement alert once."""
+        initial = {"notify_phase": "none", "last_status": "unavailable"}
+        with open(self.test_state_file, "w", encoding="utf-8") as f:
+            json.dump(initial, f)
+
+        res_open = {
+            "status": "AVAILABLE",
+            "available": True,
+            "signals_found": ["NowShowing in categories"],
+            "unavailable_signals": [],
+            "startsAt": None,
+        }
+
+        with patch.object(checker, "send_discord_notification", return_value=True) as mock_notify:
+            with patch.object(checker, "check_availability", return_value=res_open):
+                checker.main([])
+
+            self.assertEqual(mock_notify.call_count, 1)
+            with open(self.test_state_file, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"notify_phase": "open", "last_status": "available"})
+
+            # 2nd run: still open -> 0 notifications
+            mtime_before = os.path.getmtime(self.test_state_file)
+            with patch.object(checker, "check_availability", return_value=res_open):
+                checker.main([])
+
+            self.assertEqual(mock_notify.call_count, 1)
+            self.assertEqual(os.path.getmtime(self.test_state_file), mtime_before)
+
+    def test_available_then_unavailable_resets_phase_and_can_alert_again(self):
+        """Tickets become available, then vanish, then return -> resets to 'none' and alerts again."""
+        initial = {"notify_phase": "none", "last_status": "unavailable"}
+        with open(self.test_state_file, "w", encoding="utf-8") as f:
+            json.dump(initial, f)
+
+        res_avail = {
+            "status": "AVAILABLE",
+            "available": True,
+            "signals_found": ["NowShowing in categories"],
+            "unavailable_signals": [],
+            "startsAt": None,
+        }
+        res_unavail = {
+            "status": "UNAVAILABLE",
+            "available": False,
+            "signals_found": [],
+            "unavailable_signals": ["ComingSoon"],
+        }
+
+        with patch.object(checker, "send_discord_notification", return_value=True) as mock_notify:
+            # 1. Available -> notify, phase='open'
+            with patch.object(checker, "check_availability", return_value=res_avail):
+                checker.main([])
+            self.assertEqual(mock_notify.call_count, 1)
+
+            # 2. Unavailable -> resets phase to 'none'
+            with patch.object(checker, "check_availability", return_value=res_unavail):
+                checker.main([])
+            with open(self.test_state_file, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"notify_phase": "none", "last_status": "unavailable"})
+
+            # 3. Available again -> notifies a 2nd time!
+            with patch.object(checker, "check_availability", return_value=res_avail):
+                checker.main([])
+            self.assertEqual(mock_notify.call_count, 2)
+            with open(self.test_state_file, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"notify_phase": "open", "last_status": "available"})
 
 
 class TestUserAgentNormalisation(unittest.TestCase):
