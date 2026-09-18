@@ -6,9 +6,25 @@ Runs on GitHub Actions on a schedule or locally.
 
 import os
 import sys
+import re
+import time
+import random
 import json
 import argparse
 from datetime import datetime, timezone, timedelta
+try:
+    import requests
+    RequestTimeout = requests.Timeout
+    RequestConnectionError = requests.ConnectionError
+except ImportError:
+    requests = None
+
+    class RequestTimeout(Exception):
+        """Fallback exception when requests is not installed."""
+
+    class RequestConnectionError(Exception):
+        """Fallback exception when requests is not installed."""
+
 
 # Ensure UTF-8 output on Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
@@ -273,9 +289,9 @@ def save_state(state):
         print(f"[STATE] Error saving {STATE_FILE}: {e}")
 
 
-# ── Website Scraping ───────────────────────────────────────────────────────────
+# ── Browser-based Scraping (Fallback) ──────────────────────────────────────────
 
-def check_availability():
+def check_availability_browser():
     """
     Launch headless Chromium, load the SM Cinema page, wait for JavaScript rendering,
     and inspect the page for ticket availability signals.
@@ -450,6 +466,307 @@ def check_availability():
 
         finally:
             browser.close()
+
+
+# ── Direct JSON API Availability Check (Primary) ───────────────────────────────
+
+def extract_film_id(movie_url: str) -> str:
+    """
+    Extract film ID from MOVIE_URL's last path segment, e.g. HO00001619.
+    Keeps MOVIE_URL as the single point of configuration.
+    """
+    clean = (movie_url or "").strip().rstrip("/")
+    return clean.split("/")[-1] if "/" in clean else clean
+
+
+def extract_gas_token(html_text: str):
+    """
+    Extract the JWT gasToken from <script id="__NEXT_DATA__" type="application/json">.
+    Re-extracted on every run; never cached to disk or logged in full.
+    """
+    if not html_text:
+        return None
+    match = re.search(
+        r'<script\b[^>]*\bid="__NEXT_DATA__"[^>]*>(.*?)</script>',
+        html_text,
+        re.DOTALL,
+    )
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(1))
+        token = (
+            data.get("props", {})
+            .get("pageProps", {})
+            .get("environment", {})
+            .get("gasToken")
+        )
+        if token and isinstance(token, str) and token.strip():
+            return token.strip()
+    except Exception:
+        return None
+    return None
+
+
+def evaluate_availability(film_availability):
+    """
+    PROVISIONAL / INTERIM decision function evaluating the SM Cinema availability API payload.
+
+    NOTE: This rule is provisional and pending confirmation of the exact enum values
+    returned when tickets go on sale. It is isolated here so it can be amended easily.
+    Bias is toward alerting: a false ping costs nothing, a missed one costs the tickets.
+
+    Interim rule:
+      - categories contains 'ComingSoon' and advanceBookingPeriods is empty
+        and showtimeAttributeIds is empty                      -> UNAVAILABLE
+      - advanceBookingPeriods is non-empty                     -> AVAILABLE
+      - showtimeAttributeIds is non-empty                      -> AVAILABLE
+      - categories is non-empty and contains no 'ComingSoon'   -> AVAILABLE
+      - categories is empty / key missing / shape unrecognised -> ERROR (hard)
+    """
+    if not isinstance(film_availability, dict):
+        return ("ERROR", [], [], "filmAvailability is not a dictionary or missing")
+
+    if "categories" not in film_availability:
+        return ("ERROR", [], [], "filmAvailability missing 'categories' key")
+
+    categories = film_availability.get("categories")
+    advance_booking = film_availability.get("advanceBookingPeriods")
+    showtime_attrs = film_availability.get("showtimeAttributeIds")
+
+    if not isinstance(categories, list) or not isinstance(advance_booking, list) or not isinstance(showtime_attrs, list):
+        return ("ERROR", [], [], "filmAvailability shape unrecognized (expected lists)")
+
+    if len(advance_booking) > 0:
+        return ("AVAILABLE", [f"advanceBookingPeriods non-empty: {advance_booking}"], [], None)
+
+    if len(showtime_attrs) > 0:
+        return ("AVAILABLE", [f"showtimeAttributeIds non-empty: {showtime_attrs}"], [], None)
+
+    if len(categories) == 0:
+        return ("ERROR", [], [], "categories list is empty / unrecognised")
+
+    if "ComingSoon" in categories:
+        return ("UNAVAILABLE", [], [f"categories: {categories}"], None)
+
+    # categories is non-empty and does NOT contain "ComingSoon"
+    return ("AVAILABLE", [f"categories: {categories}"], [], None)
+
+
+def _check_availability_api_single(movie_url, session=None):
+    """
+    Execute a single browserless API check:
+      1. Fetch HTML page with desktop UA.
+      2. Extract gasToken from __NEXT_DATA__.
+      3. Call digital-api availability endpoint.
+      4. Evaluate availability.
+    """
+    if session is None:
+        if requests is None:
+            print("[ERROR] [API] 'requests' library not installed.")
+            return error_result("'requests' library not installed", page_title="Missing Dependency", hard=True)
+        session = requests.Session()
+
+    film_id = extract_film_id(movie_url)
+    if not film_id:
+        return error_result("Could not extract film ID from MOVIE_URL", page_title="Config Error", hard=True)
+
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Step 1: Fetch film page
+    print(f"[CHECK] [API] Fetching film page: {movie_url}")
+    try:
+        resp = session.get(movie_url, headers=headers, timeout=15)
+    except (RequestTimeout, RequestConnectionError) as e:
+        print(f"[ERROR] [API] Page fetch network error: {e}")
+        return error_result(f"Page fetch network error: {e}", page_title="Network Error", hard=False)
+    except Exception as e:
+        print(f"[ERROR] [API] Page fetch unexpected error: {e}")
+        return error_result(f"Page fetch error: {e}", page_title="Fetch Error", hard=False)
+
+    if resp.status_code == 404:
+        print("[ERROR] [API] Movie URL returned HTTP 404.")
+        return error_result("Movie URL returned HTTP 404 (film not found)", page_title="HTTP 404", hard=True)
+
+    if resp.status_code in (403, 429):
+        print(f"[ERROR] [API] Cloudflare throttle / challenge (HTTP {resp.status_code}).")
+        return error_result(
+            f"Page fetch Cloudflare throttle/block (HTTP {resp.status_code})",
+            page_title=f"HTTP {resp.status_code}",
+            hard=False,
+        )
+
+    if resp.status_code >= 500:
+        print(f"[ERROR] [API] Page fetch server error (HTTP {resp.status_code}).")
+        return error_result(
+            f"Page fetch server error (HTTP {resp.status_code})",
+            page_title=f"HTTP {resp.status_code}",
+            hard=False,
+        )
+
+    if resp.status_code != 200:
+        print(f"[ERROR] [API] Page fetch unexpected HTTP status: {resp.status_code}.")
+        return error_result(
+            f"Page fetch unexpected status HTTP {resp.status_code}",
+            page_title=f"HTTP {resp.status_code}",
+            hard=False,
+        )
+
+    # Step 2: Extract gasToken
+    gas_token = extract_gas_token(resp.text)
+    if not gas_token:
+        print("[ERROR] [API] __NEXT_DATA__ missing or gasToken absent from page HTML.")
+        return error_result(
+            "__NEXT_DATA__ missing or gasToken absent from page HTML",
+            page_title="Structure Changed",
+            hard=True,
+        )
+
+    print(f"[CHECK] [API] gasToken acquired (length {len(gas_token)}, prefix '{gas_token[:8]}...')")
+
+    # Step 3: Query digital-api availability endpoint
+    api_url = f"https://digital-api.smcinema.com/ocapi/v1/films/{film_id}/availability"
+    api_headers = {
+        "Authorization": f"Bearer {gas_token}",
+        "Accept": "application/json",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+
+    print(f"[CHECK] [API] Requesting availability: {api_url}")
+    try:
+        api_resp = session.get(api_url, headers=api_headers, timeout=15)
+    except (RequestTimeout, RequestConnectionError) as e:
+        print(f"[ERROR] [API] API request network error: {e}")
+        return error_result(f"API request network error: {e}", page_title="API Network Error", hard=False)
+    except Exception as e:
+        print(f"[ERROR] [API] API request unexpected error: {e}")
+        return error_result(f"API request error: {e}", page_title="API Error", hard=False)
+
+    if api_resp.status_code in (401, 403):
+        print(f"[ERROR] [API] API authorization error (HTTP {api_resp.status_code}).")
+        return error_result(
+            f"API authorization error (HTTP {api_resp.status_code})",
+            page_title=f"HTTP {api_resp.status_code}",
+            hard=True,
+        )
+
+    if api_resp.status_code >= 500:
+        print(f"[ERROR] [API] API server error (HTTP {api_resp.status_code}).")
+        return error_result(
+            f"API server error (HTTP {api_resp.status_code})",
+            page_title=f"HTTP {api_resp.status_code}",
+            hard=False,
+        )
+
+    if api_resp.status_code != 200:
+        print(f"[ERROR] [API] API unexpected HTTP status: {api_resp.status_code}.")
+        return error_result(
+            f"API unexpected status HTTP {api_resp.status_code}",
+            page_title=f"HTTP {api_resp.status_code}",
+            hard=False,
+        )
+
+    try:
+        data = api_resp.json()
+    except Exception as e:
+        print(f"[ERROR] [API] Failed to parse API JSON: {e}")
+        return error_result(f"API response is not valid JSON: {e}", page_title="JSON Error", hard=True)
+
+    film_avail = data.get("filmAvailability")
+    if film_avail is None or not isinstance(film_avail, dict):
+        print("[ERROR] [API] API response missing 'filmAvailability' key (schema drift).")
+        return error_result(
+            "API response missing 'filmAvailability' key (schema drift)",
+            page_title="Schema Drift",
+            hard=True,
+        )
+
+    # Step 4: Evaluate availability
+    status, found_avail, found_unavail, error_reason = evaluate_availability(film_avail)
+
+    title_match = re.search(r"<title>(.*?)</title>", resp.text, re.IGNORECASE)
+    page_title = title_match.group(1).strip() if title_match else "SM Cinema"
+
+    print(f"[CHECK] [API] Film ID: {film_avail.get('filmId')}")
+    print(f"[CHECK] [API] Categories: {film_avail.get('categories')}")
+    print(f"[CHECK] [API] Advance booking periods: {film_avail.get('advanceBookingPeriods')}")
+    print(f"[CHECK] [API] Showtime attribute IDs: {film_avail.get('showtimeAttributeIds')}")
+
+    if status == "ERROR":
+        print(f"[ERROR] [API] {error_reason}")
+        return error_result(error_reason, page_title=page_title, hard=True)
+
+    if status == "AVAILABLE":
+        print("[CHECK] Conclusion: AVAILABLE ✅")
+    else:
+        print("[CHECK] Conclusion: CONFIRMED UNAVAILABLE ❌")
+
+    print(f"[CHECK] Availability signals found: {found_avail}")
+    print(f"[CHECK] Unavailability signals found: {found_unavail}")
+
+    return {
+        "status": status,
+        "available": (status == "AVAILABLE"),
+        "signals_found": found_avail,
+        "unavailable_signals": found_unavail,
+        "page_title": page_title,
+        "error_reason": None,
+        "hard": False,
+    }
+
+
+def check_availability_api(retry_backoffs=None):
+    """
+    Check ticket availability directly via SM Cinema's internal JSON API.
+    Retries up to 3 times on soft failures with growing backoff (roughly 0s, 30s, 90s).
+    """
+    # Small random jitter (0-60s) on GitHub Actions to desynchronize cron runs
+    max_jitter = int(os.environ.get("INITIAL_DELAY_MAX", "60" if os.environ.get("GITHUB_ACTIONS") else "0"))
+    if max_jitter > 0 and not os.environ.get("SKIP_INITIAL_DELAY"):
+        jitter = random.uniform(0, max_jitter)
+        print(f"[CHECK] Initial random jitter: sleeping {jitter:.1f}s...")
+        time.sleep(jitter)
+
+    if retry_backoffs is None:
+        retry_backoffs = (0, 30, 90)
+
+    session = requests.Session() if requests is not None else None
+    last_result = None
+
+    for attempt, delay in enumerate(retry_backoffs, start=1):
+        if delay > 0:
+            print(f"[CHECK] Soft failure on previous attempt. Retrying in {delay}s (attempt {attempt}/{len(retry_backoffs)})...")
+            time.sleep(delay)
+        else:
+            print(f"[CHECK] Checking availability via API (attempt {attempt}/{len(retry_backoffs)})...")
+
+        result = _check_availability_api_single(MOVIE_URL, session=session)
+
+        if result["status"] != "ERROR":
+            return result
+
+        last_result = result
+        if result.get("hard", False):
+            print(f"[CHECK] Hard failure encountered ({result.get('error_reason')}). Aborting retries.")
+            return result
+
+    return last_result
+
+
+def check_availability():
+    """
+    Main entry point for checking ticket availability.
+    Defaults to lightweight JSON API check.
+    Set USE_BROWSER_FALLBACK=1 to use headless Playwright browser check.
+    """
+    if os.environ.get("USE_BROWSER_FALLBACK", "").lower() in ("1", "true", "yes"):
+        print("[CHECK] Mode: Browser fallback (Playwright)")
+        return check_availability_browser()
+    return check_availability_api()
 
 
 # ── Discord Notification ───────────────────────────────────────────────────────

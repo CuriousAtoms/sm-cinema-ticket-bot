@@ -7,15 +7,12 @@ An automated ticket availability monitor for **Avengers: Doomsday** at **SM Cine
 ## 🚀 Features
 
 - **Automated Monitoring:** Runs every 5 minutes on GitHub Actions.
-- **Client-Side Rendering Support:** Uses headless Playwright (Chromium) to handle JavaScript SPA hydration.
-- **Anti-Bot & Evasion Protections:** Masks `navigator.webdriver` and sets a realistic viewport and locale. The user agent is read from the bundled Chromium at runtime (with `HeadlessChrome` rewritten to `Chrome`) so the claimed browser version can never drift out of step with the real one.
-- **Three-State Detection:** Every check resolves to `AVAILABLE`, `UNAVAILABLE`, or `ERROR`. A timeout, HTTP error, Cloudflare challenge, or unrecognisable page is an `ERROR` — never a confident "no tickets yet".
-- **Scoped Signal Matching:** Reads the film status badge and buttons inside the film-details region only, so site-wide navigation and footer links cannot trigger a false alarm. Showtime elements must contain a digit to count as a real session.
-- **Detection Drift Guard:** If a page loads fine but matches no known availability *or* unavailability markers, the run is reported as `ERROR` rather than silently assuming tickets aren't out.
+- **Direct JSON API First:** Directly queries SM Cinema's internal backend (`digital-api.smcinema.com/ocapi/v1/films/<ID>/availability`) using the JWT `gasToken` extracted from the page's Next.js SSR hydration data (`__NEXT_DATA__`). Completes in ~1-2 seconds with minimal bandwidth and zero browser footprint.
+- **Opt-In Browser Fallback:** Retains the full Playwright headless browser implementation (with bot-evasion masks) via `USE_BROWSER_FALLBACK=1` and a manual `check-browser.yml` workflow.
+- **Robust Error Classification:** Soft errors (network timeouts, Cloudflare 403/429 rate limits, 5xx server errors) are automatically retried with exponential backoff. Hard errors (404 Not Found, auth rejection, schema drift) fail loudly to trigger GitHub alert notifications.
+- **Scoped Signal Matching & Interim Decision Rules:** Evaluates film availability categories, advance booking periods, and showtimes with conservative defaults biased toward alerting.
 - **Duplicate Prevention:** Alert status is tracked in `state.json`, which is committed back to the repository **only when the status actually changes** — routine checks write nothing.
 - **Schedule Keepalive:** A monthly empty commit stops GitHub from auto-disabling the cron after 60 days of repository inactivity.
-- **Loud Failures:** A block, a misconfiguration, or a page the bot can no longer read exits non-zero, so the Actions run turns red and GitHub emails you. Transient timeouts stay green and are simply retried on the next tick.
-- **Tested:** The decision logic is a pure function covered by a unit suite that runs on every push.
 - **Zero Cost:** 100% free with no credit card required.
 
 ---
@@ -84,17 +81,26 @@ python checker.py
 
 ## 🧠 How It Decides
 
+### Primary: Direct JSON API (`filmAvailability`)
 | Situation | Result |
 |---|---|
-| Booking CTA (`book now`, `buy tickets`, ...) inside the film-details region | `AVAILABLE` |
-| Showtime session elements containing a time | `AVAILABLE` |
-| Status badge reads `now showing` / `advance tickets` / `tickets on sale` | `AVAILABLE` |
-| Status badge or page text says `coming soon` and no booking CTA is present | `UNAVAILABLE` |
-| Cloudflare challenge or HTTP error | `ERROR` (hard) — run fails, state untouched |
-| Page loads but matches nothing recognisable | `ERROR` (hard) — detection drift, run fails |
-| Timeout or blank render | `ERROR` (soft) — run stays green, state untouched |
+| `advanceBookingPeriods` contains at least one booking period | `AVAILABLE` |
+| `showtimeAttributeIds` contains at least one attribute | `AVAILABLE` |
+| `categories` is non-empty and does not contain `ComingSoon` | `AVAILABLE` |
+| `categories` contains `ComingSoon` and booking/showtimes are empty | `UNAVAILABLE` |
+| Missing `filmAvailability`, unrecognised shape, or 401/403/404 | `ERROR` (hard) — run fails, state untouched |
+| Network timeout, Cloudflare 403/429, or 5xx server error | `ERROR` (soft) — auto-retried up to 3 times with backoff |
 
-`ERROR` never resets the notification flag and never writes state, so a temporary block cannot cause a repeat alert. **Hard** errors mean the bot is blind rather than unlucky, so they fail the workflow run deliberately — a green tick should only ever mean "checked successfully, no tickets yet".
+### Fallback: Headless Browser (`USE_BROWSER_FALLBACK=1`)
+| Situation | Result |
+|---|---|
+| Booking CTA (`book now`, `buy tickets`, ...) inside film-details | `AVAILABLE` |
+| Showtime session elements containing a time digit | `AVAILABLE` |
+| Status badge reads `now showing` / `advance tickets` / `tickets on sale` | `AVAILABLE` |
+| Status badge or page text says `coming soon` without booking CTA | `UNAVAILABLE` |
+| Cloudflare challenge, unrecognised page, or HTTP error | `ERROR` (hard) — run fails, state untouched |
+
+`ERROR` never resets the notification flag and never writes state, so a temporary network failure cannot cause a duplicate alert.
 
 ---
 
@@ -104,14 +110,16 @@ python checker.py
 .
 ├── .github/
 │   └── workflows/
-│       ├── check.yml       # 5-minute cron scheduler
-│       ├── keepalive.yml   # Monthly commit so the cron is not auto-disabled
-│       └── tests.yml       # Unit tests on every push
-├── .gitignore              # Ignored files
-├── checker.py              # Scraper, decision logic & Discord notifier
-├── test_checker.py         # Unit tests for the decision logic (stdlib unittest)
-├── requirements.txt        # Python dependencies
-├── state.json              # Notification status tracker
+│       ├── check.yml           # 5-minute cron scheduler (lightweight JSON API)
+│       ├── check-browser.yml   # Manual trigger for browser fallback verification
+│       ├── keepalive.yml       # Monthly commit so the cron is not auto-disabled
+│       └── tests.yml           # Unit tests on every push (45 tests, stdlib unittest)
+├── .gitignore                  # Ignored files
+├── checker.py                  # API/scraper client, decision logic & Discord notifier
+├── test_checker.py             # Complete test suite (45 tests, 0 external deps needed)
+├── requirements.txt            # Python dependencies
+├── state.json                  # Notification status tracker
 ├── discord-ticket-bot-spec.md  # Original design document (historical)
-└── README.md               # Documentation
+└── README.md                   # Documentation
 ```
+
