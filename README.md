@@ -120,10 +120,10 @@ python checker.py
 │       ├── check.yml           # 5-minute cron scheduler (lightweight JSON API)
 │       ├── check-browser.yml   # Manual trigger for browser fallback verification
 │       ├── keepalive.yml       # Monthly commit so the cron is not auto-disabled
-│       └── tests.yml           # Unit tests on every push (45 tests, stdlib unittest)
+│       └── tests.yml           # Unit tests on every push (stdlib unittest)
 ├── .gitignore                  # Ignored files
 ├── checker.py                  # API/scraper client, decision logic & Discord notifier
-├── test_checker.py             # Complete test suite (45 tests, 0 external deps needed)
+├── test_checker.py             # Complete test suite (stdlib unittest, no external deps)
 ├── requirements.txt            # Python dependencies
 ├── state.json                  # Notification status tracker
 ├── discord-ticket-bot-spec.md  # Original design document (historical)
