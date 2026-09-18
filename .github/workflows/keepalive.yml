@@ -1,0 +1,32 @@
+name: Keepalive
+
+# GitHub automatically disables scheduled workflows after 60 days with no
+# repository activity. Since checker.py only commits state.json on a real
+# status change, this repo can sit silent for months — so this job pushes an
+# empty commit once a month to reset that timer and keep the 5-minute cron alive.
+
+on:
+  schedule:
+    # 03:00 UTC on the 1st of each month (11:00 AM Manila).
+    - cron: "0 3 1 * *"
+
+  # Allow a manual nudge from the Actions web UI.
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Push an empty commit to reset the inactivity timer
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive, reset scheduled-workflow inactivity timer [skip ci]"
+          git push
