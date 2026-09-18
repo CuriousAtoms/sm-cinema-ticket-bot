@@ -308,98 +308,110 @@ class TestUserAgentNormalisation(unittest.TestCase):
 
 class TestEvaluateAvailability(unittest.TestCase):
     """
-    Unit tests for the PROVISIONAL evaluate_availability() function evaluating API payloads.
-    NOTE: These tests verify the interim decision rule and MUST be revisited once the real
-    on-sale category enum values are confirmed.
+    Unit tests for the evidence-based evaluate_availability() function evaluating API payloads.
+    Derived from observed category values across 46 live films.
     """
 
-    # Verbatim real payload observed for Avengers: Doomsday
-    REAL_PAYLOAD_COMING_SOON = {
-        "filmAvailability": {
-            "filmId": "HO00001619",
-            "siteId": None,
-            "categories": ["ComingSoon"],
-            "showtimeAttributeIds": [],
-            "advanceBookingPeriods": [],
-        },
-        "relatedData": {"attributes": []},
+    # Verbatim real fixtures from live endpoint probes
+    FIXTURE_URANUS_2324 = {
+        "categories": ["ComingSoon"],
+        "advanceBookingPeriods": [],
+        "showtimeAttributeIds": ["0000000001", "0000000006", "0000000011"],
     }
 
-    def test_interim_rule_coming_soon_unavail(self):
-        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
-        # categories == ["ComingSoon"], empty advanceBookingPeriods, empty showtimeAttributeIds -> UNAVAILABLE
-        avail = self.REAL_PAYLOAD_COMING_SOON["filmAvailability"]
-        status, found_avail, found_unavail, err = checker.evaluate_availability(avail)
+    FIXTURE_SB19 = {
+        "categories": ["ComingSoon", "AdvanceBooking"],
+        "advanceBookingPeriods": [
+            {
+                "startsAt": "2026-09-10T15:00:00+08:00",
+                "orderBookingModes": ["Paid", "Unpaid", "UnpaidConfirmed"],
+                "restriction": "None",
+                "rewardId": None,
+            }
+        ],
+        "showtimeAttributeIds": [
+            "0000000001",
+            "0000000006",
+            "0000000018",
+            "0000000030",
+            "0000000011",
+            "0000000005",
+        ],
+    }
+
+    FIXTURE_FORGOTTEN_ISLAND = {
+        "categories": ["NowShowing"],
+        "advanceBookingPeriods": [],
+        "showtimeAttributeIds": ["0000000001", "0000000005"],
+    }
+
+    FIXTURE_AVENGERS_DOOMSDAY = {
+        "categories": ["ComingSoon"],
+        "advanceBookingPeriods": [],
+        "showtimeAttributeIds": [],
+    }
+
+    def test_uranus_2324_regression_showtime_attribute_ids_ignored_is_unavailable(self):
+        """Regression test: showtimeAttributeIds is format tags (2D/3D/IMAX) and MUST be ignored."""
+        status, found_avail, found_unavail, err = checker.evaluate_availability(self.FIXTURE_URANUS_2324)
         self.assertEqual(status, "UNAVAILABLE")
         self.assertEqual(found_avail, [])
         self.assertTrue(any("ComingSoon" in u for u in found_unavail))
         self.assertIsNone(err)
 
-    def test_interim_rule_advance_booking_periods_available(self):
-        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
-        # advanceBookingPeriods is non-empty -> AVAILABLE
-        avail = {
-            "filmId": "HO00001619",
-            "siteId": None,
-            "categories": ["ComingSoon"],
-            "showtimeAttributeIds": [],
-            "advanceBookingPeriods": [{"periodId": "ADV01", "name": "Early Bird"}],
-        }
-        status, found_avail, found_unavail, err = checker.evaluate_availability(avail)
+    def test_sb19_advance_booking_open_is_available_and_carries_starts_at(self):
+        """SB19 has active booking: 'AdvanceBooking' in categories and carries startsAt."""
+        res = checker.evaluate_availability(self.FIXTURE_SB19)
+        status, found_avail, found_unavail, err = res
         self.assertEqual(status, "AVAILABLE")
-        self.assertTrue(any("advanceBookingPeriods" in a for a in found_avail))
-        self.assertEqual(found_unavail, [])
+        self.assertEqual(res.startsAt, "2026-09-10T15:00:00+08:00")
+        self.assertEqual(res["startsAt"], "2026-09-10T15:00:00+08:00")
+        self.assertTrue(any("AdvanceBooking" in a for a in found_avail))
         self.assertIsNone(err)
 
-    def test_interim_rule_showtime_attribute_ids_available(self):
-        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
-        # showtimeAttributeIds is non-empty -> AVAILABLE
-        avail = {
-            "filmId": "HO00001619",
-            "siteId": None,
-            "categories": ["ComingSoon"],
-            "showtimeAttributeIds": ["ATTR_IMAX_3D"],
-            "advanceBookingPeriods": [],
-        }
-        status, found_avail, found_unavail, err = checker.evaluate_availability(avail)
-        self.assertEqual(status, "AVAILABLE")
-        self.assertTrue(any("showtimeAttributeIds" in a for a in found_avail))
-        self.assertEqual(found_unavail, [])
-        self.assertIsNone(err)
-
-    def test_interim_rule_categories_without_coming_soon_available(self):
-        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
-        # categories is non-empty and contains no "ComingSoon" -> AVAILABLE
-        avail = {
-            "filmId": "HO00001619",
-            "siteId": None,
-            "categories": ["NowShowing"],
-            "showtimeAttributeIds": [],
-            "advanceBookingPeriods": [],
-        }
-        status, found_avail, found_unavail, err = checker.evaluate_availability(avail)
+    def test_forgotten_island_now_showing_is_available(self):
+        """Forgotten Island is in cinemas now: 'NowShowing' in categories -> AVAILABLE."""
+        status, found_avail, found_unavail, err = checker.evaluate_availability(self.FIXTURE_FORGOTTEN_ISLAND)
         self.assertEqual(status, "AVAILABLE")
         self.assertTrue(any("NowShowing" in a for a in found_avail))
         self.assertEqual(found_unavail, [])
         self.assertIsNone(err)
 
-    def test_interim_rule_empty_categories_error(self):
-        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
-        # categories list is empty -> ERROR
+    def test_avengers_doomsday_coming_soon_is_unavailable(self):
+        """Avengers: Doomsday has categories ['ComingSoon'] and empty booking/showtimes -> UNAVAILABLE."""
+        status, found_avail, found_unavail, err = checker.evaluate_availability(self.FIXTURE_AVENGERS_DOOMSDAY)
+        self.assertEqual(status, "UNAVAILABLE")
+        self.assertEqual(found_avail, [])
+        self.assertTrue(any("ComingSoon" in u for u in found_unavail))
+        self.assertIsNone(err)
+
+    def test_advance_booking_periods_alone_triggers_available(self):
+        """advanceBookingPeriods non-empty even without AdvanceBooking in categories -> AVAILABLE."""
         avail = {
-            "filmId": "HO00001619",
-            "siteId": None,
-            "categories": [],
-            "showtimeAttributeIds": [],
+            "categories": ["ComingSoon"],
+            "advanceBookingPeriods": [{"startsAt": "2026-10-01T10:00:00+08:00"}],
+        }
+        res = checker.evaluate_availability(avail)
+        self.assertEqual(res.status, "AVAILABLE")
+        self.assertEqual(res.startsAt, "2026-10-01T10:00:00+08:00")
+
+    def test_unrecognised_category_value_is_available_with_warning(self):
+        """Unrecognised category outside {ComingSoon, NowShowing, AdvanceBooking} -> AVAILABLE."""
+        avail = {
+            "categories": ["SecretScreening"],
             "advanceBookingPeriods": [],
         }
         status, found_avail, found_unavail, err = checker.evaluate_availability(avail)
+        self.assertEqual(status, "AVAILABLE")
+        self.assertTrue(any("SecretScreening" in a for a in found_avail))
+        self.assertIsNone(err)
+
+    def test_empty_categories_list_is_hard_error(self):
+        status, _, _, err = checker.evaluate_availability({"categories": []})
         self.assertEqual(status, "ERROR")
         self.assertIn("empty", err.lower())
 
-    def test_interim_rule_missing_key_or_invalid_shape_error(self):
-        # PROVISIONAL-RULE TEST: Must be revisited once the real category values are known.
-        # Missing categories or non-dict input -> ERROR
+    def test_missing_key_or_invalid_shape_is_hard_error(self):
         status1, _, _, err1 = checker.evaluate_availability({"filmId": "HO00001619"})
         self.assertEqual(status1, "ERROR")
         self.assertIn("categories", err1.lower())
@@ -409,6 +421,37 @@ class TestEvaluateAvailability(unittest.TestCase):
 
         status3, _, _, err3 = checker.evaluate_availability("not a dict")
         self.assertEqual(status3, "ERROR")
+
+
+class TestDiscordPayloadTiming(unittest.TestCase):
+    """Unit tests for distinguishing future startsAt ('opens at') vs active startsAt ('open now')."""
+
+    def test_future_starts_at_renders_opens_at(self):
+        result = {
+            "status": "AVAILABLE",
+            "signals_found": ["AdvanceBooking in categories"],
+            "startsAt": "2099-12-01T15:00:00+08:00",
+        }
+        payload = checker.build_discord_payload(result)
+        desc = payload["embeds"][0]["description"]
+        self.assertIn("opens at", desc)
+
+        sched_field = next(f for f in payload["embeds"][0]["fields"] if "Booking Schedule" in f["name"])
+        self.assertIn("opens at", sched_field["value"])
+
+    def test_past_starts_at_renders_open_now(self):
+        result = {
+            "status": "AVAILABLE",
+            "signals_found": ["AdvanceBooking in categories"],
+            "startsAt": "2020-01-01T10:00:00+08:00",
+        }
+        payload = checker.build_discord_payload(result)
+        desc = payload["embeds"][0]["description"]
+        self.assertIn("open now", desc)
+
+        sched_field = next(f for f in payload["embeds"][0]["fields"] if "Booking Schedule" in f["name"])
+        self.assertIn("open now", sched_field["value"])
+
 
 
 class TestTokenAndFilmIdExtraction(unittest.TestCase):
@@ -572,6 +615,17 @@ class TestApiFailureClassification(unittest.TestCase):
         res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
         self.assertEqual(res["status"], "ERROR")
         self.assertFalse(res["hard"])
+
+    def test_api_single_result_carries_starts_at(self):
+        session = unittest.mock.MagicMock()
+        session.get.side_effect = [
+            MockResponse(200, self.VALID_HTML),
+            MockResponse(200, json_data={"filmAvailability": TestEvaluateAvailability.FIXTURE_SB19}),
+        ]
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "AVAILABLE")
+        self.assertEqual(res["startsAt"], "2026-09-10T15:00:00+08:00")
+
 
 
 class TestApiRetryAndDispatcher(unittest.TestCase):
