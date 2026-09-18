@@ -1,0 +1,65 @@
+name: SM Cinema Ticket Checker
+
+on:
+  # Run automatically every 5 minutes
+  # GitHub Actions schedule uses UTC. UTC+8 (Manila) is 8 hours ahead.
+  schedule:
+    - cron: "*/5 * * * *"
+
+  # Allow manual trigger from the GitHub Actions web UI
+  workflow_dispatch:
+
+jobs:
+  check-tickets:
+    runs-on: ubuntu-latest
+
+    # Allow workflow to commit state.json back to repository
+    permissions:
+      contents: write
+
+    steps:
+      # 1. Checkout repository with full write token
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 2. Set up Python runtime
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Cache pip packages to optimize run time
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      # 4. Install Python dependencies
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 5. Install Playwright Chromium with system dependencies
+      - name: Install Playwright browsers
+        run: playwright install chromium --with-deps
+
+      # 6. Run ticket checker scraper
+      - name: Run ticket checker
+        env:
+          MOVIE_URL: ${{ secrets.MOVIE_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          MENTION: ${{ secrets.MENTION }}
+        run: python checker.py
+
+      # 7. Commit state.json if modified
+      - name: Save state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "chore: update state.json [skip ci]"
+          git push

@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.env
+venv/
+.venv/
+env/
+ENV/
+
+# Playwright
+.playwright/
+test-results/
+
+# Local test artifacts
+*.log
