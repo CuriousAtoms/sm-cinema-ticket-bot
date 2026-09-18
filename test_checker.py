@@ -765,6 +765,29 @@ class TestApiFailureClassification(unittest.TestCase):
         self.assertTrue(res["hard"])
         self.assertIn("authorization", res["error_reason"].lower())
 
+    def test_api_404_is_hard(self):
+        """A film ID the API does not know never self-heals, so it must fail the run."""
+        session = unittest.mock.MagicMock()
+        # Page returns 200 with a valid token, but the availability endpoint 404s
+        session.get.side_effect = [
+            MockResponse(200, self.VALID_HTML),
+            MockResponse(404, "Not Found"),
+        ]
+        res = checker._check_availability_api_single("https://www.smcinema.com/films/test/HO00001619", session=session)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertTrue(res["hard"])
+        self.assertIn("404", res["error_reason"])
+
+    def test_api_404_aborts_the_retry_ladder(self):
+        """Being hard, a 404 must stop retrying immediately rather than burning the backoff."""
+        with unittest.mock.patch.object(
+            checker, "_check_availability_api_single",
+            return_value=checker.error_result("API film not found (HTTP 404)", page_title="HTTP 404", hard=True),
+        ) as single:
+            res = checker.check_availability_api(retry_backoffs=(0, 30, 90))
+        self.assertEqual(single.call_count, 1)
+        self.assertTrue(res["hard"])
+
     def test_api_200_missing_film_availability_key_is_hard(self):
         session = unittest.mock.MagicMock()
         session.get.side_effect = [

@@ -791,6 +791,17 @@ def _check_availability_api_single(movie_url, session=None):
             hard=True,
         )
 
+    if api_resp.status_code == 404:
+        # The film ID itself is wrong or retired. Retrying cannot fix that, and a
+        # green run here would mean the bot checks nothing at all until someone
+        # notices — exactly the silent blindness the hard/soft split exists to stop.
+        print(f"[ERROR] [API] Film not found (HTTP 404) — MOVIE_URL points at film ID '{film_id}', which the API does not know.")
+        return error_result(
+            f"API film not found (HTTP 404) for film ID '{film_id}' — check MOVIE_URL",
+            page_title="HTTP 404",
+            hard=True,
+        )
+
     if api_resp.status_code >= 500:
         print(f"[ERROR] [API] API server error (HTTP {api_resp.status_code}).")
         return error_result(
