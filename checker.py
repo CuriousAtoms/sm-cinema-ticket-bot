@@ -263,25 +263,38 @@ def evaluate_signals(film_status, content_buttons, session_elements, cleaned_tex
 # ── State Management ───────────────────────────────────────────────────────────
 
 def load_state():
-    """Load the state file that tracks whether a notification has been sent."""
+    """Load the state file that tracks the notification phase and last status."""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
+                last_status = data.get("last_status", "unavailable")
+
+                # Migration from legacy boolean 'notified'
+                if "notify_phase" in data:
+                    notify_phase = data["notify_phase"]
+                elif "notified" in data:
+                    notify_phase = "open" if data["notified"] else "none"
+                else:
+                    notify_phase = "none"
+
+                if notify_phase not in ("none", "announced", "open"):
+                    notify_phase = "none"
+
                 return {
-                    "notified": bool(data.get("notified", False)),
-                    "last_status": data.get("last_status", "unavailable"),
+                    "notify_phase": notify_phase,
+                    "last_status": last_status,
                 }
         except Exception as e:
             print(f"[STATE] Error loading {STATE_FILE}: {e}. Initializing fresh state.")
-    return {"notified": False, "last_status": "unavailable"}
+    return {"notify_phase": "none", "last_status": "unavailable"}
 
 
 def save_state(state):
     """Save the state back to disk."""
     try:
         payload = {
-            "notified": bool(state.get("notified", False)),
+            "notify_phase": state.get("notify_phase", "none"),
             "last_status": state.get("last_status", "unavailable"),
         }
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -289,6 +302,27 @@ def save_state(state):
             f.write("\n")
     except Exception as e:
         print(f"[STATE] Error saving {STATE_FILE}: {e}")
+
+
+def determine_booking_phase(result):
+    """
+    Determine the booking phase for an AVAILABLE result:
+      - 'announced': Advance booking announced with startsAt in the future.
+      - 'open': Booking is open now (startsAt in the past/now, or no startsAt specified).
+    """
+    starts_at = None
+    if hasattr(result, "get"):
+        starts_at = result.get("startsAt") or result.get("starts_at")
+    if not starts_at and hasattr(result, "startsAt"):
+        starts_at = getattr(result, "startsAt", None)
+    if not starts_at and hasattr(result, "starts_at"):
+        starts_at = getattr(result, "starts_at", None)
+
+    if starts_at:
+        dt = parse_iso_datetime(starts_at)
+        if dt is not None and dt > get_manila_now():
+            return "announced"
+    return "open"
 
 
 # ── Browser-based Scraping (Fallback) ──────────────────────────────────────────
@@ -1081,7 +1115,7 @@ def main(argv=None):
     old_state = dict(state)
 
     print(f"[STATE] Current status: {state.get('last_status')}")
-    print(f"[STATE] Already notified: {state.get('notified')}")
+    print(f"[STATE] Notification phase: {state.get('notify_phase')}")
 
     result = check_availability()
     status = result["status"]
@@ -1106,42 +1140,49 @@ def main(argv=None):
 
     if status == "AVAILABLE":
         state["last_status"] = "available"
-        if not state.get("notified", False):
+        stored_phase = old_state.get("notify_phase", "none")
+        current_phase = determine_booking_phase(result)
+
+        should_notify = (
+            (stored_phase == "none" and current_phase in ("announced", "open"))
+            or (stored_phase == "announced" and current_phase == "open")
+        )
+
+        if should_notify:
             starts_at = result.get("startsAt") or result.get("starts_at")
-            if starts_at:
+            if current_phase == "announced":
                 dt = parse_iso_datetime(starts_at)
-                if dt and dt > get_manila_now():
-                    fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)")
-                    print(f"\n[ACTION] 🎉 Advance booking announced (opens at {fmt})! Sending notification...")
-                elif dt:
-                    fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)")
+                fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)") if dt else starts_at
+                print(f"\n[ACTION] 🎉 Advance booking announced (opens at {fmt})! Sending notification...")
+            else:
+                if starts_at:
+                    dt = parse_iso_datetime(starts_at)
+                    fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)") if dt else starts_at
                     print(f"\n[ACTION] 🎉 Tickets confirmed open now (started {fmt})! Sending notification...")
                 else:
-                    print(f"\n[ACTION] 🎉 Tickets confirmed available (startsAt {starts_at})! Sending notification...")
-            else:
-                print("\n[ACTION] 🎉 Tickets confirmed available for the first time! Sending notification...")
+                    print("\n[ACTION] 🎉 Tickets confirmed available (open now)! Sending notification...")
             notified = send_discord_notification(result)
             if notified or not WEBHOOK_URL:
-                state["notified"] = True
+                state["notify_phase"] = current_phase
         else:
-            print("\n[ACTION] Tickets available, but notification was already sent. Skipping.")
+            print(f"\n[ACTION] Tickets available ({current_phase}), but notification already sent ({stored_phase}). Skipping.")
     else:  # UNAVAILABLE
         state["last_status"] = "unavailable"
         print("\n[ACTION] Confirmed: No tickets available yet.")
-        # Only reset notified flag if tickets were PREVIOUSLY confirmed available and have now disappeared
-        if state.get("notified", False) and previous_status == "available":
-            state["notified"] = False
-            print("[STATE] Reset notified flag: Tickets were previously available but are now confirmed unavailable.")
+        # Only reset notify_phase if tickets were PREVIOUSLY confirmed available and have now disappeared
+        if old_state.get("notify_phase") != "none" and previous_status == "available":
+            state["notify_phase"] = "none"
+            print("[STATE] Reset notify_phase: Tickets were previously available but are now confirmed unavailable.")
 
     # 3. Only persist state to disk if state actually changed
     if (
-        state.get("notified") != old_state.get("notified")
+        state.get("notify_phase") != old_state.get("notify_phase")
         or state.get("last_status") != old_state.get("last_status")
     ):
         save_state(state)
         print(f"\n[STATE] Meaningful state change detected. Saved to {STATE_FILE}: {state}")
     else:
-        print(f"\n[STATE] No state change ({state.get('last_status')}, notified={state.get('notified')}). Zero file modifications.")
+        print(f"\n[STATE] No state change ({state.get('last_status')}, notify_phase={state.get('notify_phase')}). Zero file modifications.")
 
     print(f"\n{'='*60}\n")
 

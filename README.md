@@ -11,7 +11,7 @@ An automated ticket availability monitor for **Avengers: Doomsday** at **SM Cine
 - **Opt-In Browser Fallback:** Retains the full Playwright headless browser implementation (with bot-evasion masks) via `USE_BROWSER_FALLBACK=1` and a manual `check-browser.yml` workflow.
 - **Robust Error Classification:** Soft errors (network timeouts, Cloudflare 403/429 rate limits, 5xx server errors) are automatically retried with exponential backoff. Hard errors (404 Not Found, auth rejection, schema drift) fail loudly to trigger GitHub alert notifications.
 - **Scoped Signal Matching & Interim Decision Rules:** Evaluates film availability categories, advance booking periods, and showtimes with conservative defaults biased toward alerting.
-- **Duplicate Prevention:** Alert status is tracked in `state.json`, which is committed back to the repository **only when the status actually changes** — routine checks write nothing.
+- **Two-Phase Alert System & Duplicate Prevention:** Alert phase is tracked in `state.json` (`"notify_phase": "none" | "announced" | "open"`). If an advance booking announcement was already sent in the past, an "open now" notification still fires the moment booking seats become live. State is committed back to the repository **only when the phase or status actually changes** — routine checks write nothing.
 - **Schedule Keepalive:** A monthly empty commit stops GitHub from auto-disabling the cron after 60 days of repository inactivity.
 - **Zero Cost:** 100% free with no credit card required.
 
@@ -101,7 +101,13 @@ python checker.py
 | Status badge or page text says `coming soon` without booking CTA | `UNAVAILABLE` |
 | Cloudflare challenge, unrecognised page, or HTTP error | `ERROR` (hard) — run fails, state untouched |
 
-`ERROR` never resets the notification flag and never writes state, so a temporary network failure cannot cause a duplicate alert.
+### Multi-Phase Notification Tracking (`state.json`)
+- `none` → `announced`: Advance booking schedule announced (`startsAt` in the future) → sends "Advance booking announced" alert.
+- `announced` → `open`: Advance booking time has arrived (`startsAt` in past/now) → sends "Tickets open now!" alert.
+- `none` → `open`: Tickets released straight to sale without advance announcement → sends "Tickets open now!" alert.
+- `announced` → `announced` or `open` → `open`: No repeated alerts for the same phase.
+- `ERROR` never resets the notification phase and never writes state, so a temporary network failure cannot cause duplicate alerts.
+- Confirmed `UNAVAILABLE` resets `notify_phase` to `none` only if tickets were previously confirmed available.
 
 ---
 

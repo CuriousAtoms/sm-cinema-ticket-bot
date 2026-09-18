@@ -1,4 +1,4 @@
 {
-  "notified": false,
+  "notify_phase": "none",
   "last_status": "unavailable"
 }
