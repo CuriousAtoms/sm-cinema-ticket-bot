@@ -84,10 +84,11 @@ python checker.py
 ### Primary: Direct JSON API (`filmAvailability`)
 | Situation | Result |
 |---|---|
-| `advanceBookingPeriods` contains at least one booking period | `AVAILABLE` |
-| `showtimeAttributeIds` contains at least one attribute | `AVAILABLE` |
-| `categories` is non-empty and does not contain `ComingSoon` | `AVAILABLE` |
-| `categories` contains `ComingSoon` and booking/showtimes are empty | `UNAVAILABLE` |
+| `'AdvanceBooking'` in categories, or `advanceBookingPeriods` non-empty | `AVAILABLE` (carries earliest `startsAt`) |
+| `'NowShowing'` in categories | `AVAILABLE` |
+| `categories` contains only `'ComingSoon'` alone | `UNAVAILABLE` |
+| `showtimeAttributeIds` | Completely ignored (format tags like 2D/3D/IMAX) |
+| Category value outside `{ComingSoon, NowShowing, AdvanceBooking}` | `AVAILABLE` (logged loudly as unrecognised) |
 | Missing `filmAvailability`, unrecognised shape, or 401/403/404 | `ERROR` (hard) — run fails, state untouched |
 | Network timeout, Cloudflare 403/429, or 5xx server error | `ERROR` (soft) — auto-retried up to 3 times with backoff |
 

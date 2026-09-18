@@ -166,6 +166,8 @@ def error_result(reason, page_title="Error", hard=False):
         "page_title": page_title,
         "error_reason": reason,
         "hard": hard,
+        "startsAt": None,
+        "starts_at": None,
     }
 
 
@@ -454,6 +456,8 @@ def check_availability_browser():
                 "error_reason": error_reason,
                 # Detection drift: the page loaded but matched nothing we know.
                 "hard": (status == "ERROR"),
+                "startsAt": None,
+                "starts_at": None,
             }
 
         except PlaywrightTimeout:
@@ -508,49 +512,148 @@ def extract_gas_token(html_text: str):
     return None
 
 
+def parse_iso_datetime(dt_str):
+    """
+    Parse an ISO 8601 datetime string and normalize to Asia/Manila (UTC+8).
+    Returns timezone-aware datetime or None.
+    """
+    if not dt_str or not isinstance(dt_str, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(dt_str.strip())
+        pht = timezone(timedelta(hours=8))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=pht)
+        else:
+            dt = dt.astimezone(pht)
+        return dt
+    except Exception:
+        return None
+
+
+def find_earliest_starts_at(advance_booking_periods):
+    """
+    Finds the earliest startsAt from advanceBookingPeriods.
+    Returns (earliest_raw_str, earliest_dt) or (None, None).
+    """
+    if not isinstance(advance_booking_periods, list):
+        return None, None
+
+    parsed_periods = []
+    for period in advance_booking_periods:
+        if isinstance(period, dict) and "startsAt" in period:
+            raw = period.get("startsAt")
+            if isinstance(raw, str) and raw.strip():
+                dt = parse_iso_datetime(raw)
+                if dt is not None:
+                    parsed_periods.append((dt, raw.strip()))
+
+    if not parsed_periods:
+        return None, None
+
+    parsed_periods.sort(key=lambda x: x[0])
+    return parsed_periods[0][1], parsed_periods[0][0]
+
+
+class AvailabilityEvaluation(tuple):
+    """
+    Result of evaluate_availability().
+    Subclasses tuple to remain 100% backwards-compatible with 4-tuple unpacking:
+        status, found_avail, found_unavail, error_reason = evaluate_availability(...)
+    while also exposing startsAt and dict-like indexing.
+    """
+    def __new__(cls, status, found_avail, found_unavail, error_reason, starts_at=None):
+        return super().__new__(cls, (status, found_avail, found_unavail, error_reason))
+
+    def __init__(self, status, found_avail, found_unavail, error_reason, starts_at=None):
+        self.status = status
+        self.found_avail = found_avail
+        self.found_unavail = found_unavail
+        self.error_reason = error_reason
+        self.starts_at = starts_at
+        self.startsAt = starts_at
+
+    def __getitem__(self, item):
+        if isinstance(item, str):
+            if item in ("status", "found_avail", "found_unavail", "error_reason", "starts_at", "startsAt"):
+                return getattr(self, item)
+            raise KeyError(item)
+        return super().__getitem__(item)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except (KeyError, IndexError):
+            return default
+
+
 def evaluate_availability(film_availability):
     """
-    PROVISIONAL / INTERIM decision function evaluating the SM Cinema availability API payload.
+    Evidence-based decision function evaluating the SM Cinema availability API payload.
+    Derived from observed category values across all 46 live films:
+      ['ComingSoon']                    x22
+      ['NowShowing']                    x18
+      ['ComingSoon', 'AdvanceBooking']  x6
 
-    NOTE: This rule is provisional and pending confirmation of the exact enum values
-    returned when tickets go on sale. It is isolated here so it can be amended easily.
-    Bias is toward alerting: a false ping costs nothing, a missed one costs the tickets.
-
-    Interim rule:
-      - categories contains 'ComingSoon' and advanceBookingPeriods is empty
-        and showtimeAttributeIds is empty                      -> UNAVAILABLE
-      - advanceBookingPeriods is non-empty                     -> AVAILABLE
-      - showtimeAttributeIds is non-empty                      -> AVAILABLE
-      - categories is non-empty and contains no 'ComingSoon'   -> AVAILABLE
-      - categories is empty / key missing / shape unrecognised -> ERROR (hard)
+    Decision rule:
+      1. 'AdvanceBooking' in categories, or advanceBookingPeriods non-empty -> AVAILABLE
+      2. 'NowShowing' in categories                                        -> AVAILABLE
+      3. categories == ['ComingSoon'] alone                                -> UNAVAILABLE
+      4. showtimeAttributeIds is completely IGNORED (these are format tags
+         like 2D/3D/IMAX assigned long before tickets go on sale).
+      5. A category value outside {ComingSoon, NowShowing, AdvanceBooking} -> AVAILABLE
+         (logged loudly as an unrecognised value; bias stays toward alerting).
+      6. categories missing, empty, or not a list                          -> ERROR (hard)
     """
     if not isinstance(film_availability, dict):
-        return ("ERROR", [], [], "filmAvailability is not a dictionary or missing")
+        return AvailabilityEvaluation("ERROR", [], [], "filmAvailability is not a dictionary or missing")
 
     if "categories" not in film_availability:
-        return ("ERROR", [], [], "filmAvailability missing 'categories' key")
+        return AvailabilityEvaluation("ERROR", [], [], "filmAvailability missing 'categories' key")
 
     categories = film_availability.get("categories")
+    if not isinstance(categories, list) or len(categories) == 0:
+        return AvailabilityEvaluation("ERROR", [], [], "categories missing, empty, or not a list")
+
     advance_booking = film_availability.get("advanceBookingPeriods")
-    showtime_attrs = film_availability.get("showtimeAttributeIds")
+    if not isinstance(advance_booking, list):
+        advance_booking = []
 
-    if not isinstance(categories, list) or not isinstance(advance_booking, list) or not isinstance(showtime_attrs, list):
-        return ("ERROR", [], [], "filmAvailability shape unrecognized (expected lists)")
+    earliest_starts_at, _ = find_earliest_starts_at(advance_booking)
 
-    if len(advance_booking) > 0:
-        return ("AVAILABLE", [f"advanceBookingPeriods non-empty: {advance_booking}"], [], None)
+    # 1. 'AdvanceBooking' in categories, or advanceBookingPeriods non-empty -> AVAILABLE
+    if "AdvanceBooking" in categories or len(advance_booking) > 0:
+        signals = []
+        if "AdvanceBooking" in categories:
+            signals.append(f"AdvanceBooking in categories: {categories}")
+        if len(advance_booking) > 0:
+            signals.append(f"advanceBookingPeriods non-empty (count {len(advance_booking)})")
+        if earliest_starts_at:
+            signals.append(f"earliest startsAt: {earliest_starts_at}")
+        return AvailabilityEvaluation("AVAILABLE", signals, [], None, starts_at=earliest_starts_at)
 
-    if len(showtime_attrs) > 0:
-        return ("AVAILABLE", [f"showtimeAttributeIds non-empty: {showtime_attrs}"], [], None)
+    # 2. 'NowShowing' in categories -> AVAILABLE
+    if "NowShowing" in categories:
+        return AvailabilityEvaluation("AVAILABLE", [f"NowShowing in categories: {categories}"], [], None)
 
-    if len(categories) == 0:
-        return ("ERROR", [], [], "categories list is empty / unrecognised")
+    # 5. A category value outside {ComingSoon, NowShowing, AdvanceBooking} -> AVAILABLE
+    known_categories = {"ComingSoon", "NowShowing", "AdvanceBooking"}
+    unknown_categories = [c for c in categories if c not in known_categories]
+    if unknown_categories:
+        print(f"[WARN] [API] Unrecognised category value(s) detected: {unknown_categories}")
+        return AvailabilityEvaluation(
+            "AVAILABLE",
+            [f"Unrecognised category value(s): {unknown_categories}"],
+            [],
+            None,
+            starts_at=earliest_starts_at,
+        )
 
-    if "ComingSoon" in categories:
-        return ("UNAVAILABLE", [], [f"categories: {categories}"], None)
+    # 3. categories == ['ComingSoon'] alone -> UNAVAILABLE
+    if set(categories) == {"ComingSoon"}:
+        return AvailabilityEvaluation("UNAVAILABLE", [], [f"categories: {categories}"], None)
 
-    # categories is non-empty and does NOT contain "ComingSoon"
-    return ("AVAILABLE", [f"categories: {categories}"], [], None)
+    return AvailabilityEvaluation("ERROR", [], [], f"Unhandled categories shape: {categories}")
 
 
 def _check_availability_api_single(movie_url, session=None):
@@ -686,7 +789,9 @@ def _check_availability_api_single(movie_url, session=None):
         )
 
     # Step 4: Evaluate availability
-    status, found_avail, found_unavail, error_reason = evaluate_availability(film_avail)
+    eval_result = evaluate_availability(film_avail)
+    status, found_avail, found_unavail, error_reason = eval_result
+    earliest_starts_at = getattr(eval_result, "startsAt", None)
 
     title_match = re.search(r"<title>(.*?)</title>", resp.text, re.IGNORECASE)
     page_title = title_match.group(1).strip() if title_match else "SM Cinema"
@@ -701,7 +806,21 @@ def _check_availability_api_single(movie_url, session=None):
         return error_result(error_reason, page_title=page_title, hard=True)
 
     if status == "AVAILABLE":
-        print("[CHECK] Conclusion: AVAILABLE ✅")
+        if earliest_starts_at:
+            dt = parse_iso_datetime(earliest_starts_at)
+            if dt and dt > get_manila_now():
+                fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)")
+                print(f"[CHECK] [API] Advance booking opens in the future: opens at {fmt}")
+                print(f"[CHECK] Conclusion: AVAILABLE (opens at {fmt}) ✅")
+            elif dt:
+                fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)")
+                print(f"[CHECK] [API] Advance booking is active: open now (started {fmt})")
+                print(f"[CHECK] Conclusion: AVAILABLE (open now) ✅")
+            else:
+                print(f"[CHECK] [API] Advance booking startsAt: {earliest_starts_at}")
+                print("[CHECK] Conclusion: AVAILABLE ✅")
+        else:
+            print("[CHECK] Conclusion: AVAILABLE ✅")
     else:
         print("[CHECK] Conclusion: CONFIRMED UNAVAILABLE ❌")
 
@@ -716,6 +835,8 @@ def _check_availability_api_single(movie_url, session=None):
         "page_title": page_title,
         "error_reason": None,
         "hard": False,
+        "startsAt": earliest_starts_at,
+        "starts_at": earliest_starts_at,
     }
 
 
@@ -771,12 +892,11 @@ def check_availability():
 
 # ── Discord Notification ───────────────────────────────────────────────────────
 
-def send_discord_notification(result, is_test=False):
-    """Send a formatted Discord embed notification via Webhook."""
-    if not WEBHOOK_URL:
-        print("[WARN] No DISCORD_WEBHOOK_URL set. Notification cannot be sent.")
-        return False
-
+def build_discord_payload(result, is_test=False):
+    """
+    Build the formatted Discord embed payload.
+    Uses startsAt to distinguish booking in the future ('opens at <time>') from active booking ('open now').
+    """
     now_manila = get_manila_now()
     timestamp = now_manila.strftime("%B %d, %Y at %I:%M %p (PHT)")
 
@@ -789,47 +909,90 @@ def send_discord_notification(result, is_test=False):
 
     signals_text = ", ".join(result.get("signals_found", [])) or "Manual test trigger"
 
-    payload = {
+    description = (
+        "This is a test notification confirming your Discord webhook configuration works!"
+        if is_test
+        else (
+            "Tickets for **Avengers: Doomsday** have just become available "
+            "on SM Cinema!\n\nHead over and book your seats before they sell out."
+        )
+    )
+
+    timing_field = None
+    starts_at_str = result.get("startsAt") or result.get("starts_at")
+    if not is_test and starts_at_str:
+        starts_dt = parse_iso_datetime(starts_at_str)
+        if starts_dt:
+            formatted_time = starts_dt.strftime("%B %d, %Y at %I:%M %p (PHT)")
+            if starts_dt > now_manila:
+                header_content = (
+                    f"🚨 {MENTION} **ADVANCE BOOKING ANNOUNCED!**"
+                    if MENTION
+                    else "🚨 **ADVANCE BOOKING ANNOUNCED!**"
+                )
+                title = "🎟️ Avengers: Doomsday — Advance Booking Announced!"
+                description = (
+                    f"Advance booking for **Avengers: Doomsday** opens at **{formatted_time}** "
+                    f"on SM Cinema!\n\nSet a reminder and be ready to book your seats once booking goes live."
+                )
+                timing_field = {
+                    "name": "⏰ Booking Schedule",
+                    "value": f"opens at {formatted_time}",
+                    "inline": False,
+                }
+            else:
+                description = (
+                    f"Tickets for **Avengers: Doomsday** are open now on SM Cinema!\n\n"
+                    f"Head over and book your seats before they sell out."
+                )
+                timing_field = {
+                    "name": "⏰ Booking Schedule",
+                    "value": f"open now (booking began {formatted_time})",
+                    "inline": False,
+                }
+
+    fields = [
+        {
+            "name": "🎬 Movie",
+            "value": "Avengers: Doomsday",
+            "inline": True,
+        },
+        {
+            "name": "🏢 Cinema",
+            "value": "SM Cinema",
+            "inline": True,
+        },
+        {
+            "name": "🔗 Book Now",
+            "value": f"[Click here to book]({MOVIE_URL})",
+            "inline": False,
+        },
+        {
+            "name": "⏰ Detected At",
+            "value": timestamp,
+            "inline": False,
+        },
+    ]
+
+    if timing_field:
+        fields.append(timing_field)
+
+    fields.append(
+        {
+            "name": "📡 Signals Detected",
+            "value": signals_text,
+            "inline": False,
+        }
+    )
+
+    return {
         "content": header_content,
         "embeds": [
             {
                 "title": title,
-                "description": (
-                    "This is a test notification confirming your Discord webhook configuration works!"
-                    if is_test
-                    else (
-                        "Tickets for **Avengers: Doomsday** have just become available "
-                        "on SM Cinema!\n\nHead over and book your seats before they sell out."
-                    )
-                ),
-                "color": 0x3498DB if is_test else 0xE40000,  # Blue for test, Marvel Red for alert
-                "fields": [
-                    {
-                        "name": "🎬 Movie",
-                        "value": "Avengers: Doomsday",
-                        "inline": True,
-                    },
-                    {
-                        "name": "🏢 Cinema",
-                        "value": "SM Cinema",
-                        "inline": True,
-                    },
-                    {
-                        "name": "🔗 Book Now",
-                        "value": f"[Click here to book]({MOVIE_URL})",
-                        "inline": False,
-                    },
-                    {
-                        "name": "⏰ Detected At",
-                        "value": timestamp,
-                        "inline": False,
-                    },
-                    {
-                        "name": "📡 Signals Detected",
-                        "value": signals_text,
-                        "inline": False,
-                    },
-                ],
+                "description": description,
+                "color": 0x3498DB if is_test else 0xE40000,
+                "fields": fields,
                 "footer": {
                     "text": "SM Cinema Ticket Bot • Runs via GitHub Actions"
                 },
@@ -839,6 +1002,26 @@ def send_discord_notification(result, is_test=False):
             }
         ],
     }
+
+
+def send_discord_notification(result, is_test=False):
+    """Send a formatted Discord embed notification via Webhook."""
+    if not WEBHOOK_URL:
+        print("[WARN] No DISCORD_WEBHOOK_URL set. Notification cannot be sent.")
+        return False
+
+    payload = build_discord_payload(result, is_test=is_test)
+
+    starts_at_str = result.get("startsAt") or result.get("starts_at")
+    if starts_at_str:
+        starts_dt = parse_iso_datetime(starts_at_str)
+        if starts_dt:
+            formatted = starts_dt.strftime("%B %d, %Y at %I:%M %p (PHT)")
+            if starts_dt > get_manila_now():
+                print(f"[DISCORD] Notification: Advance booking opens at {formatted}")
+            else:
+                print(f"[DISCORD] Notification: Booking is open now (started {formatted})")
+
 
     try:
         try:
@@ -924,7 +1107,19 @@ def main(argv=None):
     if status == "AVAILABLE":
         state["last_status"] = "available"
         if not state.get("notified", False):
-            print("\n[ACTION] 🎉 Tickets confirmed available for the first time! Sending notification...")
+            starts_at = result.get("startsAt") or result.get("starts_at")
+            if starts_at:
+                dt = parse_iso_datetime(starts_at)
+                if dt and dt > get_manila_now():
+                    fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)")
+                    print(f"\n[ACTION] 🎉 Advance booking announced (opens at {fmt})! Sending notification...")
+                elif dt:
+                    fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)")
+                    print(f"\n[ACTION] 🎉 Tickets confirmed open now (started {fmt})! Sending notification...")
+                else:
+                    print(f"\n[ACTION] 🎉 Tickets confirmed available (startsAt {starts_at})! Sending notification...")
+            else:
+                print("\n[ACTION] 🎉 Tickets confirmed available for the first time! Sending notification...")
             notified = send_discord_notification(result)
             if notified or not WEBHOOK_URL:
                 state["notified"] = True
