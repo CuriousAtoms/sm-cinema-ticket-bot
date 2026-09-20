@@ -50,10 +50,13 @@ def get_manila_now():
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-MOVIE_URL = os.environ.get(
-    "MOVIE_URL",
-    "https://www.smcinema.com/films/Avengers-Doomsday/HO00001619"
-)
+DEFAULT_MOVIE_URL = "https://www.smcinema.com/films/Avengers-Doomsday/HO00001619"
+
+# os.environ.get(key, default) only falls back when the key is ABSENT. GitHub
+# Actions always defines `MOVIE_URL: ${{ secrets.MOVIE_URL }}`, and an unset
+# secret expands to an empty string — so the documented default would never
+# apply on Actions. Treat blank as unset.
+MOVIE_URL = (os.environ.get("MOVIE_URL") or "").strip() or DEFAULT_MOVIE_URL
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 MENTION = os.environ.get("MENTION", "")  # e.g. "@everyone" or "<@&ROLE_ID>"
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Manila")
@@ -517,6 +520,41 @@ def extract_film_id(movie_url: str) -> str:
     return clean.split("/")[-1] if "/" in clean else clean
 
 
+# SM Cinema film IDs are 'HO' followed by 8 digits.
+FILM_ID_RE = re.compile(r"^HO\d{8}$", re.IGNORECASE)
+
+
+def looks_like_film_id(film_id: str) -> bool:
+    """True if film_id has SM Cinema's HO######## shape."""
+    return bool(FILM_ID_RE.match((film_id or "").strip()))
+
+
+def fetch_film_title(film_id, gas_token, session, timeout=15):
+    """
+    Resolve a film ID to its human-readable title via /ocapi/v1/films/<id>.
+
+    smcinema.com is a client-rendered SPA: every URL returns HTTP 200 with no
+    <title>, so nothing else in the run can tell you WHICH movie was checked.
+    Best-effort only — returns None on any failure rather than failing the run.
+    """
+    try:
+        resp = session.get(
+            f"https://digital-api.smcinema.com/ocapi/v1/films/{film_id}",
+            headers={
+                "Authorization": f"Bearer {gas_token}",
+                "Accept": "application/json",
+                "User-Agent": DEFAULT_USER_AGENT,
+            },
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            return None
+        title = resp.json().get("film", {}).get("title", {}).get("text")
+        return title.strip() if isinstance(title, str) and title.strip() else None
+    except Exception:
+        return None
+
+
 def extract_gas_token(html_text: str):
     """
     Extract the JWT gasToken from <script id="__NEXT_DATA__" type="application/json">.
@@ -708,6 +746,19 @@ def _check_availability_api_single(movie_url, session=None):
     if not film_id:
         return error_result("Could not extract film ID from MOVIE_URL", page_title="Config Error", hard=True)
 
+    # The page fetch below cannot catch a bad URL — smcinema.com is a SPA that
+    # answers 200 for any path, including invented ones. So the film ID is the
+    # only thing worth validating, and it has to happen here.
+    if not looks_like_film_id(film_id):
+        print(f"[ERROR] [API] MOVIE_URL ends in '{film_id}', which is not an SM Cinema film ID.")
+        print("[ERROR] [API] MOVIE_URL must end with the film ID, e.g.")
+        print("[ERROR] [API]   https://www.smcinema.com/films/Fall-2-Deadpoint/HO00001625")
+        return error_result(
+            f"MOVIE_URL must end with a film ID like HO00001625, got '{film_id}'",
+            page_title="Config Error",
+            hard=True,
+        )
+
     headers = {
         "User-Agent": DEFAULT_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -841,6 +892,8 @@ def _check_availability_api_single(movie_url, session=None):
     title_match = re.search(r"<title>(.*?)</title>", resp.text, re.IGNORECASE)
     page_title = title_match.group(1).strip() if title_match else "SM Cinema"
 
+    film_title = fetch_film_title(film_id, gas_token, session)
+    print(f"[CHECK] [API] Movie: {film_title or '(title unavailable)'}")
     print(f"[CHECK] [API] Film ID: {film_avail.get('filmId')}")
     print(f"[CHECK] [API] Categories: {film_avail.get('categories')}")
     print(f"[CHECK] [API] Advance booking periods: {film_avail.get('advanceBookingPeriods')}")
@@ -882,7 +935,85 @@ def _check_availability_api_single(movie_url, session=None):
         "hard": False,
         "startsAt": earliest_starts_at,
         "starts_at": earliest_starts_at,
+        "film_title": film_title,
+        "film_id": film_id,
     }
+
+
+def list_films(session=None):
+    """
+    Print every film SM Cinema currently knows about, with its film ID.
+
+    This is the discovery step for MOVIE_URL: the site is a SPA, so there is no
+    page you can read a film ID off of. Returns a list of (film_id, title).
+    """
+    if session is None:
+        if requests is None:
+            print("[ERROR] 'requests' library not installed.")
+            return []
+        session = requests.Session()
+
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        resp = session.get("https://www.smcinema.com/movies", headers=headers, timeout=15)
+    except Exception as e:
+        print(f"[ERROR] Could not reach smcinema.com: {e}")
+        return []
+
+    gas_token = extract_gas_token(resp.text)
+    if not gas_token:
+        print("[ERROR] Could not extract gasToken from smcinema.com.")
+        return []
+
+    try:
+        api_resp = session.get(
+            "https://digital-api.smcinema.com/ocapi/v1/films",
+            headers={
+                "Authorization": f"Bearer {gas_token}",
+                "Accept": "application/json",
+                "User-Agent": DEFAULT_USER_AGENT,
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        print(f"[ERROR] Film list request failed: {e}")
+        return []
+
+    if api_resp.status_code != 200:
+        print(f"[ERROR] Film list returned HTTP {api_resp.status_code}.")
+        return []
+
+    try:
+        films = api_resp.json().get("films", [])
+    except Exception as e:
+        print(f"[ERROR] Film list is not valid JSON: {e}")
+        return []
+
+    rows = []
+    for film in films:
+        if not isinstance(film, dict):
+            continue
+        film_id = film.get("id")
+        title = (film.get("title") or {}).get("text")
+        if film_id and title:
+            rows.append((film_id, title))
+
+    rows.sort(key=lambda r: r[1].lower())
+
+    print(f"{len(rows)} films currently listed on SM Cinema:\n")
+    for film_id, title in rows:
+        print(f"  {film_id}  {title}")
+    if rows:
+        example_id, example_title = rows[0]
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", example_title).strip("-")
+        print(f"\nSet MOVIE_URL to the film page URL ending in the ID, e.g.")
+        print(f"  https://www.smcinema.com/films/{slug}/{example_id}")
+    return rows
 
 
 def check_availability_api(retry_backoffs=None):
@@ -945,7 +1076,10 @@ def build_discord_payload(result, is_test=False):
     now_manila = get_manila_now()
     timestamp = now_manila.strftime("%B %d, %Y at %I:%M %p (PHT)")
 
-    title = "🧪 [TEST] SM Cinema Ticket Bot Verification" if is_test else "🎟️ Avengers: Doomsday — Book Now!"
+    # Whatever film MOVIE_URL points at — not always Avengers: Doomsday.
+    movie_name = result.get("film_title") or "this movie"
+
+    title = "🧪 [TEST] SM Cinema Ticket Bot Verification" if is_test else f"🎟️ {movie_name} — Book Now!"
     header_content = (
         "🧪 **Test alert from SM Cinema Ticket Bot**"
         if is_test
@@ -958,7 +1092,7 @@ def build_discord_payload(result, is_test=False):
         "This is a test notification confirming your Discord webhook configuration works!"
         if is_test
         else (
-            "Tickets for **Avengers: Doomsday** have just become available "
+            f"Tickets for **{movie_name}** have just become available "
             "on SM Cinema!\n\nHead over and book your seats before they sell out."
         )
     )
@@ -975,9 +1109,9 @@ def build_discord_payload(result, is_test=False):
                     if MENTION
                     else "🚨 **ADVANCE BOOKING ANNOUNCED!**"
                 )
-                title = "🎟️ Avengers: Doomsday — Advance Booking Announced!"
+                title = f"🎟️ {movie_name} — Advance Booking Announced!"
                 description = (
-                    f"Advance booking for **Avengers: Doomsday** opens at **{formatted_time}** "
+                    f"Advance booking for **{movie_name}** opens at **{formatted_time}** "
                     f"on SM Cinema!\n\nSet a reminder and be ready to book your seats once booking goes live."
                 )
                 timing_field = {
@@ -987,7 +1121,7 @@ def build_discord_payload(result, is_test=False):
                 }
             else:
                 description = (
-                    f"Tickets for **Avengers: Doomsday** are open now on SM Cinema!\n\n"
+                    f"Tickets for **{movie_name}** are open now on SM Cinema!\n\n"
                     f"Head over and book your seats before they sell out."
                 )
                 timing_field = {
@@ -999,7 +1133,7 @@ def build_discord_payload(result, is_test=False):
     fields = [
         {
             "name": "🎬 Movie",
-            "value": "Avengers: Doomsday",
+            "value": movie_name,
             "inline": True,
         },
         {
@@ -1030,23 +1164,128 @@ def build_discord_payload(result, is_test=False):
         }
     )
 
+    embed = {
+        "title": title,
+        "description": description,
+        "color": 0x3498DB if is_test else 0xE40000,
+        "fields": fields,
+        "footer": {
+            "text": "SM Cinema Ticket Bot • Runs via GitHub Actions"
+        },
+    }
+
+    # Only attach the Avengers poster when that is actually the film being
+    # watched — otherwise the alert illustrates the wrong movie.
+    if MOVIE_URL == DEFAULT_MOVIE_URL:
+        embed["thumbnail"] = {
+            "url": "https://upload.wikimedia.org/wikipedia/en/9/98/Avengers_Doomsday_poster.jpg"
+        }
+
     return {
         "content": header_content,
-        "embeds": [
-            {
-                "title": title,
-                "description": description,
-                "color": 0x3498DB if is_test else 0xE40000,
-                "fields": fields,
-                "footer": {
-                    "text": "SM Cinema Ticket Bot • Runs via GitHub Actions"
-                },
-                "thumbnail": {
-                    "url": "https://upload.wikimedia.org/wikipedia/en/9/98/Avengers_Doomsday_poster.jpg"
-                },
-            }
-        ],
+        "embeds": [embed],
     }
+
+
+# ── Webhook Preflight Diagnostics ─────────────────────────────────────────────
+
+WEBHOOK_URL_RE = re.compile(
+    r"^https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api(?:/v\d+)?/webhooks/(\d+)/([\w-]+)$"
+)
+
+
+def describe_webhook_url(url):
+    """
+    Describe a webhook URL's SHAPE without revealing it.
+
+    Safe to print in a public repository's Actions log: reports only lengths,
+    structural checks and the last 4 characters of the (non-secret) webhook ID.
+    The token is never shown. Returns a list of display lines.
+    """
+    raw = url or ""
+    stripped = raw.strip().strip('"').strip("'")
+    lines = [f"total length: {len(raw)} chars"]
+
+    if not stripped:
+        lines.append("EMPTY — the secret is unset or blank")
+        return lines
+
+    if raw != stripped:
+        lines.append("WARNING: value has surrounding whitespace or quotes — strip them")
+
+    match = WEBHOOK_URL_RE.match(stripped)
+    if not match:
+        lines.append("does NOT match https://discord.com/api/webhooks/<id>/<token>")
+        if "discord" not in stripped.lower():
+            lines.append("HINT: this does not look like a Discord URL at all")
+        elif "/webhooks/" not in stripped:
+            lines.append("HINT: missing the '/api/webhooks/' path segment")
+        else:
+            lines.append("HINT: likely truncated, or the token segment is missing")
+        return lines
+
+    webhook_id, token = match.group(1), match.group(2)
+    lines.append(f"webhook id: {len(webhook_id)} digits, ends ...{webhook_id[-4:]}")
+    lines.append(f"token: {len(token)} chars (not shown)")
+
+    if not (17 <= len(webhook_id) <= 20):
+        lines.append(f"WARNING: webhook id should be 17-20 digits, got {len(webhook_id)}")
+    if len(token) < 60:
+        lines.append(f"WARNING: token looks truncated ({len(token)} chars, expected ~68)")
+    if len(webhook_id) >= 17 and len(token) >= 60:
+        lines.append("shape looks correct")
+    return lines
+
+
+def verify_webhook(url=None, session=None):
+    """
+    Preflight the webhook with GET before posting anything.
+
+    Discord's GET /webhooks/<id>/<token> returns the webhook object when it is
+    live, so this cleanly separates "the webhook does not exist" from "the
+    message payload was rejected". Returns True when the webhook is usable.
+    """
+    target = WEBHOOK_URL if url is None else url
+
+    print("[DISCORD] Webhook preflight (no secret values are printed):")
+    for line in describe_webhook_url(target):
+        print(f"[DISCORD]   {line}")
+
+    if not (target or "").strip():
+        return False
+
+    if requests is None:
+        print("[DISCORD]   (skipping live check — 'requests' not installed)")
+        return False
+
+    sess = session or requests
+    try:
+        resp = sess.get(target.strip(), timeout=10)
+    except Exception as e:
+        print(f"[DISCORD]   live check failed: {e}")
+        return False
+
+    if resp.status_code == 200:
+        try:
+            info = resp.json()
+            print(f"[DISCORD]   ✅ webhook is live — name '{info.get('name')}', channel id {info.get('channel_id')}")
+        except Exception:
+            print("[DISCORD]   ✅ webhook is live")
+        return True
+
+    if resp.status_code == 404:
+        print("[DISCORD]   ❌ Discord does not recognise this webhook (404 Unknown Webhook).")
+        print("[DISCORD]      The webhook was deleted, or the URL stored in the secret is wrong.")
+        print("[DISCORD]      Recreate it: channel Settings -> Integrations -> Webhooks -> New Webhook,")
+        print("[DISCORD]      use 'Copy Webhook URL', and paste the whole thing into DISCORD_WEBHOOK_URL.")
+        return False
+
+    if resp.status_code in (401, 403):
+        print(f"[DISCORD]   ❌ Webhook token rejected (HTTP {resp.status_code}) — re-copy the full URL.")
+        return False
+
+    print(f"[DISCORD]   ❌ Unexpected response HTTP {resp.status_code}")
+    return False
 
 
 def send_discord_notification(result, is_test=False):
@@ -1077,6 +1316,15 @@ def send_discord_notification(result, is_test=False):
                 return True
             else:
                 print(f"[DISCORD] ❌ Failed to send. Status: {response.status_code} — {response.text}")
+                # Say WHY in the same log entry, so a failing scheduled run is
+                # self-diagnosing instead of just repeating the same 404 forever.
+                if response.status_code in (401, 403, 404):
+                    for line in describe_webhook_url(WEBHOOK_URL):
+                        print(f"[DISCORD]   {line}")
+                    if response.status_code == 404:
+                        print("[DISCORD]   -> Discord does not recognise this webhook. Recreate it in the")
+                        print("[DISCORD]      channel (Integrations -> Webhooks -> New Webhook), then update")
+                        print("[DISCORD]      the DISCORD_WEBHOOK_URL secret with the full 'Copy Webhook URL'.")
                 return False
         except ImportError:
             import urllib.request
@@ -1106,7 +1354,16 @@ def main(argv=None):
         action="store_true",
         help="Send a test notification to Discord Webhook and exit",
     )
+    parser.add_argument(
+        "--list-films",
+        action="store_true",
+        help="List every film currently on SM Cinema with its film ID, and exit",
+    )
     args = parser.parse_args(argv)
+
+    if args.list_films:
+        list_films()
+        return
 
     now = get_manila_now().strftime("%Y-%m-%d %H:%M:%S PHT")
 
@@ -1115,7 +1372,12 @@ def main(argv=None):
     print(f"{'='*60}\n")
 
     if args.test_discord:
-        print("[TEST] Sending test notification to Discord...")
+        print("[TEST] Verifying Discord webhook configuration...")
+        if not verify_webhook():
+            print("\n[TEST] ❌ Webhook is not usable — not sending. Fix the above, then re-run.")
+            print(f"\n{'='*60}\n")
+            sys.exit(1)
+        print("\n[TEST] Sending test notification to Discord...")
         send_discord_notification(
             {"signals_found": ["CLI --test-discord trigger"]},
             is_test=True,
@@ -1173,7 +1435,11 @@ def main(argv=None):
                 else:
                     print("\n[ACTION] 🎉 Tickets confirmed available (open now)! Sending notification...")
             notified = send_discord_notification(result)
-            if notified or not WEBHOOK_URL:
+            # Only advance the phase once the alert has actually landed. Advancing
+            # it when no webhook is configured would commit "already notified" back
+            # to the repo and permanently suppress the alert — including after the
+            # webhook is later fixed. A failed send must stay retryable.
+            if notified:
                 state["notify_phase"] = current_phase
         else:
             print(f"\n[ACTION] Tickets available ({current_phase}), but notification already sent ({stored_phase}). Skipping.")

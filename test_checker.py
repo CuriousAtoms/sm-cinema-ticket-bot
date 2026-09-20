@@ -871,5 +871,247 @@ class TestApiRetryAndDispatcher(unittest.TestCase):
             mock_api.assert_not_called()
 
 
+class TestMovieIdentityGuards(unittest.TestCase):
+    """
+    Regression tests for the "bot silently checked the wrong movie" class of bug.
+
+    smcinema.com is a client-rendered SPA: every path returns HTTP 200 with no
+    <title>, so a mistyped MOVIE_URL cannot be caught by the page fetch and the
+    run output gave no clue which film was actually evaluated.
+    """
+
+    VALID_HTML = """
+    <html><body>
+    <script id="__NEXT_DATA__" type="application/json">
+    {"props":{"pageProps":{"environment":{"gasToken":"valid_token_12345"}}}}
+    </script>
+    </body></html>
+    """
+
+    def test_looks_like_film_id(self):
+        self.assertTrue(checker.looks_like_film_id("HO00001625"))
+        self.assertTrue(checker.looks_like_film_id("HO00001619"))
+        self.assertFalse(checker.looks_like_film_id("fall-2-deadpoint"))
+        self.assertFalse(checker.looks_like_film_id("HO123"))
+        self.assertFalse(checker.looks_like_film_id("A000001960"))
+        self.assertFalse(checker.looks_like_film_id(""))
+        self.assertFalse(checker.looks_like_film_id(None))
+
+    def test_slug_only_url_is_hard_error(self):
+        """A URL missing the film ID must fail loudly, not report 'no tickets'."""
+        session = unittest.mock.MagicMock()
+        res = checker._check_availability_api_single(
+            "https://www.smcinema.com/movies/fall-2-deadpoint", session=session
+        )
+        self.assertEqual(res["status"], "ERROR")
+        self.assertTrue(res["hard"])
+        self.assertIn("film ID", res["error_reason"])
+        # Must not have burned a request on an unusable URL.
+        session.get.assert_not_called()
+
+    def test_blank_movie_url_falls_back_to_default(self):
+        """An unset GitHub secret expands to '', which must not defeat the default."""
+        with patch.dict(os.environ, {"MOVIE_URL": ""}):
+            resolved = (os.environ.get("MOVIE_URL") or "").strip() or checker.DEFAULT_MOVIE_URL
+        self.assertEqual(resolved, checker.DEFAULT_MOVIE_URL)
+        self.assertTrue(checker.looks_like_film_id(checker.extract_film_id(resolved)))
+
+    def test_film_title_is_resolved_and_returned(self):
+        session = unittest.mock.MagicMock()
+        session.get.side_effect = [
+            MockResponse(200, self.VALID_HTML),
+            MockResponse(200, json_data={
+                "filmAvailability": {"filmId": "HO00001625", "categories": ["NowShowing"]}
+            }),
+            MockResponse(200, json_data={"film": {"title": {"text": "Fall 2: Deadpoint"}}}),
+        ]
+        res = checker._check_availability_api_single(
+            "https://www.smcinema.com/films/Fall-2-Deadpoint/HO00001625", session=session
+        )
+        self.assertEqual(res["status"], "AVAILABLE")
+        self.assertEqual(res["film_title"], "Fall 2: Deadpoint")
+        self.assertEqual(res["film_id"], "HO00001625")
+
+    def test_title_lookup_failure_does_not_fail_the_run(self):
+        """Title resolution is cosmetic; losing it must not change the verdict."""
+        session = unittest.mock.MagicMock()
+        session.get.side_effect = [
+            MockResponse(200, self.VALID_HTML),
+            MockResponse(200, json_data={
+                "filmAvailability": {"filmId": "HO00001625", "categories": ["NowShowing"]}
+            }),
+            MockResponse(500, "boom"),
+        ]
+        res = checker._check_availability_api_single(
+            "https://www.smcinema.com/films/Fall-2-Deadpoint/HO00001625", session=session
+        )
+        self.assertEqual(res["status"], "AVAILABLE")
+        self.assertIsNone(res["film_title"])
+
+    def test_payload_uses_resolved_title_not_hardcoded_movie(self):
+        payload = checker.build_discord_payload({
+            "status": "AVAILABLE",
+            "signals_found": ["NowShowing in categories"],
+            "film_title": "Fall 2: Deadpoint",
+        })
+        embed = payload["embeds"][0]
+        movie_field = next(f for f in embed["fields"] if "Movie" in f["name"])
+        self.assertEqual(movie_field["value"], "Fall 2: Deadpoint")
+        self.assertIn("Fall 2: Deadpoint", embed["title"])
+        self.assertNotIn("Avengers", embed["title"])
+        self.assertNotIn("Avengers", embed["description"])
+
+    def test_payload_advance_booking_uses_resolved_title(self):
+        payload = checker.build_discord_payload({
+            "status": "AVAILABLE",
+            "signals_found": ["AdvanceBooking in categories"],
+            "startsAt": "2099-12-01T15:00:00+08:00",
+            "film_title": "Fall 2: Deadpoint",
+        })
+        embed = payload["embeds"][0]
+        self.assertIn("Fall 2: Deadpoint", embed["title"])
+        self.assertNotIn("Avengers", embed["description"])
+
+class TestFailedSendStaysRetryable(unittest.TestCase):
+    """
+    Regression tests for the real-world outage: Discord returned
+    404 {"message": "Unknown Webhook", "code": 10015} on every run, so the
+    alert never arrived. A send that did not land must never be recorded as
+    "already notified", or the alert is burned permanently.
+    """
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.test_state_file = os.path.join(self.tmp_dir.name, "test_state.json")
+        self._original_state_file = checker.STATE_FILE
+        checker.STATE_FILE = self.test_state_file
+        with open(self.test_state_file, "w", encoding="utf-8") as f:
+            json.dump({"notify_phase": "none", "last_status": "unavailable"}, f)
+
+    def tearDown(self):
+        checker.STATE_FILE = self._original_state_file
+        self.tmp_dir.cleanup()
+
+    RES_OPEN = {
+        "status": "AVAILABLE",
+        "available": True,
+        "signals_found": ["NowShowing in categories"],
+        "unavailable_signals": [],
+        "film_title": "Fall 2: Deadpoint",
+    }
+
+    def _phase(self):
+        with open(self.test_state_file, "r", encoding="utf-8") as f:
+            return json.load(f)["notify_phase"]
+
+    def test_failed_send_does_not_advance_phase(self):
+        """A rejected webhook (404 Unknown Webhook) must leave the phase retryable."""
+        with patch.object(checker, "WEBHOOK_URL", "https://discord.com/api/webhooks/dead"),              patch.object(checker, "send_discord_notification", return_value=False),              patch.object(checker, "check_availability", return_value=self.RES_OPEN):
+            checker.main([])
+        self.assertEqual(self._phase(), "none")
+
+    def test_missing_webhook_does_not_advance_phase(self):
+        """
+        With no webhook configured the phase must still NOT advance — otherwise
+        'already notified' is committed to the repo and the alert is suppressed
+        forever, including after the webhook is later configured correctly.
+        """
+        with patch.object(checker, "WEBHOOK_URL", ""),              patch.object(checker, "check_availability", return_value=self.RES_OPEN):
+            checker.main([])
+        self.assertEqual(self._phase(), "none")
+
+    def test_alert_fires_on_the_next_run_once_webhook_is_fixed(self):
+        """After failed runs, a working webhook must still produce the alert."""
+        with patch.object(checker, "WEBHOOK_URL", "https://discord.com/api/webhooks/dead"),              patch.object(checker, "send_discord_notification", return_value=False),              patch.object(checker, "check_availability", return_value=self.RES_OPEN):
+            checker.main([])
+            checker.main([])
+
+        with patch.object(checker, "WEBHOOK_URL", "https://discord.com/api/webhooks/fixed"),              patch.object(checker, "send_discord_notification", return_value=True) as ok,              patch.object(checker, "check_availability", return_value=self.RES_OPEN):
+            checker.main([])
+            self.assertEqual(ok.call_count, 1)
+        self.assertEqual(self._phase(), "open")
+
+    def test_successful_send_still_advances_and_then_skips(self):
+        """The happy path must be unchanged: notify once, then stay quiet."""
+        with patch.object(checker, "WEBHOOK_URL", "https://discord.com/api/webhooks/ok"),              patch.object(checker, "send_discord_notification", return_value=True) as ok,              patch.object(checker, "check_availability", return_value=self.RES_OPEN):
+            checker.main([])
+            checker.main([])
+            self.assertEqual(ok.call_count, 1)
+        self.assertEqual(self._phase(), "open")
+
+
+class TestWebhookPreflight(unittest.TestCase):
+    """
+    Tests for the webhook preflight added after every scheduled run failed with
+    404 {"message": "Unknown Webhook", "code": 10015} for two days straight.
+
+    The diagnostics run in a PUBLIC repo's Actions log, so the hard requirement
+    is that they never reveal the token.
+    """
+
+    GOOD = "https://discord.com/api/webhooks/1234567890123456789/" + ("a" * 68)
+
+    def test_well_formed_url_reports_correct_shape(self):
+        lines = " | ".join(checker.describe_webhook_url(self.GOOD))
+        self.assertIn("shape looks correct", lines)
+        self.assertIn("19 digits", lines)
+        self.assertIn("68 chars", lines)
+
+    def test_token_is_never_printed(self):
+        """The single most important property of these diagnostics."""
+        secret_token = "s3cr3t" * 11
+        url = "https://discord.com/api/webhooks/1234567890123456789/" + secret_token
+        for line in checker.describe_webhook_url(url):
+            self.assertNotIn(secret_token, line)
+            self.assertNotIn("s3cr3t", line)
+
+    def test_truncated_token_is_flagged(self):
+        lines = " | ".join(checker.describe_webhook_url(
+            "https://discord.com/api/webhooks/1234567890123456789/abc123"))
+        self.assertIn("truncated", lines)
+
+    def test_empty_value_is_flagged(self):
+        self.assertIn("EMPTY", " | ".join(checker.describe_webhook_url("")))
+        self.assertIn("EMPTY", " | ".join(checker.describe_webhook_url("   ")))
+
+    def test_surrounding_quotes_or_whitespace_flagged(self):
+        lines = " | ".join(checker.describe_webhook_url(f'  "{self.GOOD}"  '))
+        self.assertIn("whitespace or quotes", lines)
+
+    def test_non_webhook_urls_are_rejected(self):
+        for bad in ["https://example.com/hook/abc",
+                    "https://discord.com/channels/123456789/987654321",
+                    "https://discord.com/api/webhooks/1234567890123456789"]:
+            self.assertIn("does NOT match", " | ".join(checker.describe_webhook_url(bad)))
+
+    def test_verify_webhook_true_when_discord_returns_200(self):
+        session = unittest.mock.MagicMock()
+        session.get.return_value = MockResponse(
+            200, json_data={"name": "ticket-bot", "channel_id": "42"})
+        self.assertTrue(checker.verify_webhook(self.GOOD, session=session))
+
+    def test_verify_webhook_false_on_404_unknown_webhook(self):
+        """The exact live failure: Discord does not know this webhook."""
+        session = unittest.mock.MagicMock()
+        session.get.return_value = MockResponse(
+            404, json_data={"message": "Unknown Webhook", "code": 10015})
+        self.assertFalse(checker.verify_webhook(self.GOOD, session=session))
+
+    def test_verify_webhook_false_on_401(self):
+        session = unittest.mock.MagicMock()
+        session.get.return_value = MockResponse(401, "Unauthorized")
+        self.assertFalse(checker.verify_webhook(self.GOOD, session=session))
+
+    def test_verify_webhook_skips_live_call_when_blank(self):
+        session = unittest.mock.MagicMock()
+        self.assertFalse(checker.verify_webhook("", session=session))
+        session.get.assert_not_called()
+
+    def test_verify_webhook_survives_network_error(self):
+        session = unittest.mock.MagicMock()
+        session.get.side_effect = Exception("connection reset")
+        self.assertFalse(checker.verify_webhook(self.GOOD, session=session))
+
+
 if __name__ == "__main__":
     unittest.main()

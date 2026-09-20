@@ -1,0 +1,34 @@
+name: Verify Discord Webhook
+
+# Manual only. Checks the DISCORD_WEBHOOK_URL secret as it is actually stored,
+# without waiting for the 5-minute checker cron and without touching state.json.
+# The secret's value is never printed — only its shape (lengths, structure) and
+# Discord's verdict on whether the webhook exists.
+on:
+  workflow_dispatch:
+
+jobs:
+  verify-webhook:
+    runs-on: ubuntu-latest
+
+    # Read-only: this workflow must never write state.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify webhook and send a test message
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          MENTION: ${{ secrets.MENTION }}
+        run: python checker.py --test-discord

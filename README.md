@@ -32,12 +32,91 @@ An automated ticket availability monitor for **Avengers: Doomsday** at **SM Cine
 | Secret Name | Value | Required |
 |---|---|---|
 | `DISCORD_WEBHOOK_URL` | Your Discord webhook URL | Yes |
-| `MOVIE_URL` | `https://www.smcinema.com/films/Avengers-Doomsday/HO00001619` | Optional (defaults to Avengers: Doomsday) |
+| `MOVIE_URL` | `https://www.smcinema.com/films/Avengers-Doomsday/HO00001619` | Optional (defaults to Avengers: Doomsday) — **must end with the film ID**, see below |
 | `MENTION` | `@everyone` or `<@&ROLE_ID>` | Optional |
 
 4. **Workflow Permissions**
    - Both workflows declare `permissions: contents: write` themselves, so no repository setting is normally needed.
    - If the "Save state" step ever fails to push, go to **Settings** -> **Actions** -> **General** and select **Read and write permissions**.
+
+---
+
+## 🚑 Troubleshooting: Tickets Detected but No Discord Message
+
+The run log tells you which half failed. Check the Actions log for the `[DISCORD]` line:
+
+| Log line | Meaning | Fix |
+|---|---|---|
+| `❌ Failed to send. Status: 404 — {"message": "Unknown Webhook", "code": 10015}` | The webhook no longer exists — deleted, regenerated, or the URL in the secret is truncated/mistyped. | Recreate the webhook in Discord and update the `DISCORD_WEBHOOK_URL` secret. |
+| `❌ Failed to send. Status: 401/403` | Webhook token is wrong. | Re-copy the full webhook URL into the secret. |
+| `❌ Failed to send. Status: 400` | Malformed payload. | Check `MENTION` is a valid `@everyone` or `<@&ROLE_ID>`. |
+| `⚠️ No DISCORD_WEBHOOK_URL set` | The secret is missing or empty. | Add the secret; confirm the name matches exactly. |
+| `✅ Notification sent successfully!` | Discord accepted it. | If you still see nothing, check the channel the webhook targets. |
+
+A failed send never advances `notify_phase`, so the alert stays pending and fires on the
+next run once the webhook works — you do not lose the notification.
+
+### Testing the secret as actually stored
+
+You cannot read a GitHub secret back, so a webhook that was pasted in wrong looks
+identical to one that works. Run the **Verify Discord Webhook** workflow
+(Actions tab → *Verify Discord Webhook* → **Run workflow**) to check the stored value
+directly. It is read-only, never touches `state.json`, and prints only the URL's
+*shape* — never the token:
+
+```
+[DISCORD] Webhook preflight (no secret values are printed):
+[DISCORD]   total length: 121 chars
+[DISCORD]   webhook id: 19 digits, ends ...6789
+[DISCORD]   token: 68 chars (not shown)
+[DISCORD]   shape looks correct
+[DISCORD]   ✅ webhook is live — name 'ticket-bot', channel id 1234567890
+```
+
+A healthy webhook URL is ~121 characters: a 17–20 digit ID and a ~68 character token.
+A short token means the value was truncated when pasted.
+
+The same preflight runs locally against your own copy of the URL:
+
+```bash
+python checker.py --test-discord
+```
+
+---
+
+## 🎯 Pointing the Bot at a Different Movie
+
+`MOVIE_URL` **must end with the SM Cinema film ID** (`HO` + 8 digits). The film ID is
+the only part the bot uses — the slug before it is ignored.
+
+```
+https://www.smcinema.com/films/Fall-2-Deadpoint/HO00001625
+                                                └── the part that matters
+```
+
+This matters more than it looks. `smcinema.com` is a client-rendered single-page app:
+**every** URL returns HTTP 200 with no `<title>`, including invented ones like
+`/films/Totally-Made-Up-Slug/HO00001625`. A wrong URL therefore cannot be caught by
+loading the page — only the film ID can be validated, so a URL that does not end in one
+fails the run immediately with an explanatory error.
+
+To find a film ID, list every film currently in the system:
+
+```bash
+python checker.py --list-films
+```
+
+Every run also prints the resolved title of the film it actually checked:
+
+```
+[CHECK] [API] Movie: Fall 2: Deadpoint
+[CHECK] [API] Film ID: HO00001625
+[CHECK] [API] Categories: ['NowShowing']
+[CHECK] Conclusion: AVAILABLE ✅
+```
+
+If that `Movie:` line is not the film you expected, `MOVIE_URL` is not reaching the
+script — check the secret name, or that your shell actually exported it.
 
 ---
 
@@ -119,6 +198,7 @@ python checker.py
 │   └── workflows/
 │       ├── check.yml           # 5-minute cron scheduler (lightweight JSON API)
 │       ├── check-browser.yml   # Manual trigger for browser fallback verification
+│       ├── verify-webhook.yml  # Manual Discord webhook preflight (read-only)
 │       ├── keepalive.yml       # Monthly commit so the cron is not auto-disabled
 │       └── tests.yml           # Unit tests on every push (stdlib unittest)
 ├── .gitignore                  # Ignored files
