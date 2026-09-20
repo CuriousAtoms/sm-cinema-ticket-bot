@@ -188,7 +188,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
 
     def test_routine_unavailable_run_does_not_modify_state_file(self):
         """A routine run with status 'unavailable' does NOT rewrite state.json."""
-        initial = {"notify_phase": "none", "last_status": "unavailable"}
+        initial = {"notify_phase": "none", "last_status": "unavailable", "film_id": "HO00001619"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
         mtime_before = os.path.getmtime(self.test_state_file)
@@ -210,7 +210,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
 
     def test_hard_error_preserves_state_and_fails_the_run(self):
         """A hard ERROR (Cloudflare block) keeps state AND exits non-zero so Actions goes red."""
-        initial = {"notify_phase": "open", "last_status": "available"}
+        initial = {"notify_phase": "open", "last_status": "available", "film_id": "HO00001619"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
         mtime_before = os.path.getmtime(self.test_state_file)
@@ -236,7 +236,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
 
     def test_soft_error_preserves_state_and_keeps_the_run_green(self):
         """A transient ERROR (timeout) keeps state and must NOT fail the run."""
-        initial = {"notify_phase": "open", "last_status": "available"}
+        initial = {"notify_phase": "open", "last_status": "available", "film_id": "HO00001619"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
         mtime_before = os.path.getmtime(self.test_state_file)
@@ -260,7 +260,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
 
     def test_notify_phase_resets_only_when_previously_available_and_now_unavailable(self):
         """notify_phase resets to 'none' ONLY when transitioning available -> unavailable."""
-        initial = {"notify_phase": "open", "last_status": "available"}
+        initial = {"notify_phase": "open", "last_status": "available", "film_id": "HO00001619"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
 
@@ -334,7 +334,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
         2. Booking opens (startsAt in past/now) -> 2nd notification sent, state='open'.
         3. Next run (still open) -> 0 notifications sent, zero file modifications.
         """
-        initial = {"notify_phase": "none", "last_status": "unavailable"}
+        initial = {"notify_phase": "none", "last_status": "unavailable", "film_id": "HO00001619"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
 
@@ -361,7 +361,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
             self.assertEqual(mock_notify.call_count, 1)
             with open(self.test_state_file, "r", encoding="utf-8") as f:
                 state1 = json.load(f)
-            self.assertEqual(state1, {"notify_phase": "announced", "last_status": "available"})
+            self.assertEqual(state1, {"notify_phase": "announced", "last_status": "available", "film_id": "HO00001619"})
 
             # Intermediate run: Still announced (future) -> should skip
             mtime_before_skip1 = os.path.getmtime(self.test_state_file)
@@ -378,7 +378,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
             self.assertEqual(mock_notify.call_count, 2)
             with open(self.test_state_file, "r", encoding="utf-8") as f:
                 state2 = json.load(f)
-            self.assertEqual(state2, {"notify_phase": "open", "last_status": "available"})
+            self.assertEqual(state2, {"notify_phase": "open", "last_status": "available", "film_id": "HO00001619"})
 
             # Run 3: Next run (still open) -> must skip and write nothing
             mtime_before_skip2 = os.path.getmtime(self.test_state_file)
@@ -392,7 +392,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
 
     def test_straight_to_open_from_none(self):
         """Tickets released straight to sale without prior announcement alert once."""
-        initial = {"notify_phase": "none", "last_status": "unavailable"}
+        initial = {"notify_phase": "none", "last_status": "unavailable", "film_id": "HO00001619"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
 
@@ -410,7 +410,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
 
             self.assertEqual(mock_notify.call_count, 1)
             with open(self.test_state_file, "r", encoding="utf-8") as f:
-                self.assertEqual(json.load(f), {"notify_phase": "open", "last_status": "available"})
+                self.assertEqual(json.load(f), {"notify_phase": "open", "last_status": "available", "film_id": "HO00001619"})
 
             # 2nd run: still open -> 0 notifications
             mtime_before = os.path.getmtime(self.test_state_file)
@@ -422,7 +422,7 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
 
     def test_available_then_unavailable_resets_phase_and_can_alert_again(self):
         """Tickets become available, then vanish, then return -> resets to 'none' and alerts again."""
-        initial = {"notify_phase": "none", "last_status": "unavailable"}
+        initial = {"notify_phase": "none", "last_status": "unavailable", "film_id": "HO00001619"}
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump(initial, f)
 
@@ -450,14 +450,14 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
             with patch.object(checker, "check_availability", return_value=res_unavail):
                 checker.main([])
             with open(self.test_state_file, "r", encoding="utf-8") as f:
-                self.assertEqual(json.load(f), {"notify_phase": "none", "last_status": "unavailable"})
+                self.assertEqual(json.load(f), {"notify_phase": "none", "last_status": "unavailable", "film_id": "HO00001619"})
 
             # 3. Available again -> notifies a 2nd time!
             with patch.object(checker, "check_availability", return_value=res_avail):
                 checker.main([])
             self.assertEqual(mock_notify.call_count, 2)
             with open(self.test_state_file, "r", encoding="utf-8") as f:
-                self.assertEqual(json.load(f), {"notify_phase": "open", "last_status": "available"})
+                self.assertEqual(json.load(f), {"notify_phase": "open", "last_status": "available", "film_id": "HO00001619"})
 
 
 class TestUserAgentNormalisation(unittest.TestCase):
@@ -1111,6 +1111,117 @@ class TestWebhookPreflight(unittest.TestCase):
         session = unittest.mock.MagicMock()
         session.get.side_effect = Exception("connection reset")
         self.assertFalse(checker.verify_webhook(self.GOOD, session=session))
+
+
+class TestFilmSwitchResetsPhase(unittest.TestCase):
+    """
+    A notification phase describes ONE film. Repointing MOVIE_URL at a different
+    film must not inherit the previous film's "already notified", or the new
+    film's alert is silently swallowed.
+    """
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.test_state_file = os.path.join(self.tmp_dir.name, "test_state.json")
+        self._original_state_file = checker.STATE_FILE
+        checker.STATE_FILE = self.test_state_file
+
+    def tearDown(self):
+        checker.STATE_FILE = self._original_state_file
+        self.tmp_dir.cleanup()
+
+    def _write(self, state):
+        with open(self.test_state_file, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+    def _read(self):
+        with open(self.test_state_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    @staticmethod
+    def _available(film_id, starts_at=None):
+        return {
+            "status": "AVAILABLE", "available": True,
+            "signals_found": ["AdvanceBooking in categories"],
+            "unavailable_signals": [], "page_title": "SM Cinema",
+            "error_reason": None, "hard": False,
+            "startsAt": starts_at, "starts_at": starts_at,
+            "film_title": "Some Film", "film_id": film_id,
+        }
+
+    def test_switching_film_alerts_even_if_previous_film_was_notified(self):
+        """The regression: new film already on sale, old phase was 'open'."""
+        self._write({"notify_phase": "open", "last_status": "available",
+                     "film_id": "HO00001625"})
+        with patch.object(checker, "WEBHOOK_URL", "https://discord.com/api/webhooks/x/y"),              patch.object(checker, "send_discord_notification", return_value=True) as notify,              patch.object(checker, "check_availability",
+                          return_value=self._available("HO00001619")):
+            checker.main([])
+            self.assertEqual(notify.call_count, 1)
+        self.assertEqual(self._read()["film_id"], "HO00001619")
+
+    def test_same_film_still_suppresses_duplicates(self):
+        """The reset must be film-specific, not a blanket re-alert."""
+        self._write({"notify_phase": "open", "last_status": "available",
+                     "film_id": "HO00001619"})
+        with patch.object(checker, "WEBHOOK_URL", "https://discord.com/api/webhooks/x/y"),              patch.object(checker, "send_discord_notification", return_value=True) as notify,              patch.object(checker, "check_availability",
+                          return_value=self._available("HO00001619")):
+            checker.main([])
+            notify.assert_not_called()
+
+    def test_film_id_is_recorded_on_first_run(self):
+        """Legacy state files predate film tracking; the id is added on the next run."""
+        self._write({"notify_phase": "none", "last_status": "unavailable"})
+        with patch.object(checker, "WEBHOOK_URL", "https://discord.com/api/webhooks/x/y"),              patch.object(checker, "send_discord_notification", return_value=True),              patch.object(checker, "check_availability",
+                          return_value=self._available("HO00001619")):
+            checker.main([])
+        self.assertEqual(self._read()["film_id"], "HO00001619")
+
+    def test_legacy_state_without_film_id_loads_cleanly(self):
+        self._write({"notify_phase": "announced", "last_status": "available"})
+        loaded = checker.load_state()
+        self.assertEqual(loaded["notify_phase"], "announced")
+        self.assertIsNone(loaded["film_id"])
+
+    def test_save_state_omits_film_id_when_unknown(self):
+        """Never write a null film_id — keep the file to the keys that mean something."""
+        checker.save_state({"notify_phase": "none", "last_status": "unavailable",
+                            "film_id": None})
+        self.assertNotIn("film_id", self._read())
+
+    def test_doomsday_full_lifecycle_after_switching_from_fall_2(self):
+        """
+        End-to-end dress rehearsal for the Doomsday listing, starting from the
+        state Fall 2 left behind: coming soon -> announced -> open, alerting
+        exactly twice and never repeating.
+        """
+        self._write({"notify_phase": "open", "last_status": "available",
+                     "film_id": "HO00001625"})
+
+        coming_soon = {
+            "status": "UNAVAILABLE", "available": False, "signals_found": [],
+            "unavailable_signals": ["categories: ['ComingSoon']"],
+            "page_title": "SM Cinema", "error_reason": None, "hard": False,
+            "film_title": "Avengers: Doomsday", "film_id": "HO00001619",
+        }
+        announced = self._available("HO00001619", "2099-12-01T10:00:00+08:00")
+        open_now = self._available("HO00001619", "2020-01-01T10:00:00+08:00")
+
+        with patch.object(checker, "WEBHOOK_URL", "https://discord.com/api/webhooks/x/y"),              patch.object(checker, "send_discord_notification", return_value=True) as notify:
+            for label, res, expected_calls in [
+                ("switch to Doomsday", coming_soon, 0),
+                ("still coming soon", coming_soon, 0),
+                ("advance booking announced", announced, 1),
+                ("still announced", announced, 1),
+                ("booking opens", open_now, 2),
+                ("still open", open_now, 2),
+            ]:
+                with patch.object(checker, "check_availability", return_value=res):
+                    checker.main([])
+                self.assertEqual(notify.call_count, expected_calls, label)
+
+        self.assertEqual(self._read(),
+                         {"notify_phase": "open", "last_status": "available",
+                          "film_id": "HO00001619"})
 
 
 if __name__ == "__main__":

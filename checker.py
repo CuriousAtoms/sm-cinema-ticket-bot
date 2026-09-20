@@ -284,13 +284,19 @@ def load_state():
                 if notify_phase not in ("none", "announced", "open"):
                     notify_phase = "none"
 
+                # Absent on state files written before film tracking existed.
+                film_id = data.get("film_id")
+                if not isinstance(film_id, str) or not film_id.strip():
+                    film_id = None
+
                 return {
                     "notify_phase": notify_phase,
                     "last_status": last_status,
+                    "film_id": film_id,
                 }
         except Exception as e:
             print(f"[STATE] Error loading {STATE_FILE}: {e}. Initializing fresh state.")
-    return {"notify_phase": "none", "last_status": "unavailable"}
+    return {"notify_phase": "none", "last_status": "unavailable", "film_id": None}
 
 
 def save_state(state):
@@ -300,6 +306,11 @@ def save_state(state):
             "notify_phase": state.get("notify_phase", "none"),
             "last_status": state.get("last_status", "unavailable"),
         }
+        # Records WHICH film the phase above refers to, so repointing MOVIE_URL
+        # at another film cannot inherit its predecessor's "already notified".
+        film_id = state.get("film_id")
+        if isinstance(film_id, str) and film_id.strip():
+            payload["film_id"] = film_id.strip()
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
             f.write("\n")
@@ -1411,6 +1422,21 @@ def main(argv=None):
     # 2. Genuine page reading obtained
     previous_status = old_state.get("last_status", "unavailable")
 
+    # A phase describes one film. If MOVIE_URL now points somewhere else, the
+    # stored phase belongs to the previous film — carrying it over would mark
+    # the new film as "already notified" and silently swallow its alert.
+    current_film_id = result.get("film_id") or extract_film_id(MOVIE_URL)
+    previous_film_id = old_state.get("film_id")
+    if current_film_id:
+        state["film_id"] = current_film_id
+        if previous_film_id and previous_film_id != current_film_id:
+            print(f"[STATE] Film changed ({previous_film_id} -> {current_film_id}). "
+                  f"Resetting notification phase for the new film.")
+            old_state = dict(old_state)
+            old_state["notify_phase"] = "none"
+            state["notify_phase"] = "none"
+            previous_status = "unavailable"
+
     if status == "AVAILABLE":
         state["last_status"] = "available"
         stored_phase = old_state.get("notify_phase", "none")
@@ -1455,6 +1481,7 @@ def main(argv=None):
     if (
         state.get("notify_phase") != old_state.get("notify_phase")
         or state.get("last_status") != old_state.get("last_status")
+        or state.get("film_id") != old_state.get("film_id")
     ):
         save_state(state)
         print(f"\n[STATE] Meaningful state change detected. Saved to {STATE_FILE}: {state}")

@@ -180,6 +180,19 @@ python checker.py
 | Status badge or page text says `coming soon` without booking CTA | `UNAVAILABLE` |
 | Cloudflare challenge, unrecognised page, or HTTP error | `ERROR` (hard) — run fails, state untouched |
 
+### Switching Which Film Is Watched
+
+`state.json` records the `film_id` its phase belongs to. Repoint `MOVIE_URL` at a
+different film and the phase resets automatically on the next run:
+
+```
+[STATE] Film changed (HO00001625 -> HO00001619). Resetting notification phase for the new film.
+```
+
+Without this, switching to a film whose tickets are *already* on sale would inherit the
+previous film's `"open"` phase and silently swallow the alert. `film_id` is added to
+`state.json` on the first run after upgrading; state files written before it still load.
+
 ### Multi-Phase Notification Tracking (`state.json`)
 - `none` → `announced`: Advance booking schedule announced (`startsAt` in the future) → sends "Advance booking announced" alert.
 - `announced` → `open`: Advance booking time has arrived (`startsAt` in past/now) → sends "Tickets open now!" alert.
