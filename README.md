@@ -6,7 +6,7 @@ An automated ticket availability monitor for **Avengers: Doomsday** at **SM Cine
 
 ## 🚀 Features
 
-- **Automated Monitoring:** Runs every 5 minutes on GitHub Actions.
+- **Automated Monitoring:** Checks every 5 minutes, from a loop inside a long-running GitHub Actions job rather than from the cron itself — see [Why the cron is only a starter](#-why-the-cron-is-only-a-starter).
 - **Direct JSON API First:** Directly queries SM Cinema's internal backend (`digital-api.smcinema.com/ocapi/v1/films/<ID>/availability`) using the JWT `gasToken` extracted from the page's Next.js SSR hydration data (`__NEXT_DATA__`). Completes in ~1-2 seconds with minimal bandwidth and zero browser footprint.
 - **Opt-In Browser Fallback:** Retains the full Playwright headless browser implementation (with bot-evasion masks) via `USE_BROWSER_FALLBACK=1` and a manual `check-browser.yml` workflow.
 - **Robust Error Classification:** Soft errors (network timeouts, Cloudflare 403/429 rate limits, 5xx server errors) are automatically retried with exponential backoff. Hard errors (404 Not Found, auth rejection, schema drift) fail loudly to trigger GitHub alert notifications.
@@ -20,7 +20,7 @@ An automated ticket availability monitor for **Avengers: Doomsday** at **SM Cine
 ## 🛠️ GitHub Repository Setup
 
 1. **Create a Public GitHub Repository**
-   - Push this codebase to your repository. A **public** repository is effectively required: private repositories on the Free plan get 2,000 Actions minutes per month, and a 5-minute cadence burns that in roughly two days.
+   - Push this codebase to your repository. A **public** repository is effectively required: private repositories on the Free plan get 2,000 Actions minutes per month, and this bot holds a runner open for hours at a time (see below), which would exhaust that almost immediately. Public repositories get unlimited free Actions minutes.
 
 2. **Create a Discord Webhook**
    - In Discord, go to your target channel settings -> **Integrations** -> **Webhooks** -> **New Webhook**.
@@ -81,6 +81,49 @@ The same preflight runs locally against your own copy of the URL:
 ```bash
 python checker.py --test-discord
 ```
+
+---
+
+## ⏱️ Why the Cron Is Only a Starter
+
+`check.yml` declares `cron: "0 * * * *"` — hourly — yet the bot checks every five
+minutes. That is deliberate, and it is worth understanding before changing either
+number.
+
+GitHub runs `schedule` events on a **best-effort queue**, and drops most of a
+high-frequency cron on free and public repositories. This repo previously declared
+`*/5 * * * *`. Measured over 65 hours of real runs, it actually delivered:
+
+| | |
+|---|---|
+| Declared | every 5 min |
+| Median gap | **148 min** |
+| Worst gap | **330 min** (5h30m) |
+| Runs fired | **22 of ~774 expected (2.8%)** |
+
+For a bot whose only job is noticing a ticket drop quickly, that is the difference
+between five minutes late and half a day late — and nothing in the logs said so,
+because every run that *did* fire succeeded.
+
+So the cadence no longer comes from the cron. Each job loops internally, checking
+every 5 minutes for 5h40m before exiting, and `concurrency` keeps exactly one
+checker alive:
+
+- The hourly cron just needs to land often enough that a run is always queued.
+- GitHub keeps **one** run pending per concurrency group and cancels older pending
+  ones. Those cancellations are normal, not failures.
+- When the active run hits its deadline, the queued run takes over immediately, so
+  coverage is continuous no matter how late any individual cron fires.
+
+Two consequences worth knowing:
+
+- **`state.json` is committed inside the loop**, not at job end. `checker.py` sends
+  the alert and advances `notify_phase` together; if that phase only reached the
+  repo hours later, a cancelled job would lose it and the next run would replay the
+  same alert.
+- **A hard failure ends the run immediately** so it shows red, rather than looping
+  quietly on a bot that is checking nothing. Soft failures are already retried
+  inside `checker.py` and do not end the loop.
 
 ---
 
@@ -244,7 +287,7 @@ previous film's `"open"` phase and silently swallow the alert. `film_id` is adde
 .
 ├── .github/
 │   └── workflows/
-│       ├── check.yml           # 5-minute cron scheduler (lightweight JSON API)
+│       ├── check.yml           # Hourly starter + in-job 5-minute loop (JSON API)
 │       ├── check-browser.yml   # Manual trigger for browser fallback verification
 │       ├── verify-webhook.yml  # Manual Discord webhook preflight (read-only)
 │       ├── simulate-alert.yml  # Manual real-looking alert preview (read-only)

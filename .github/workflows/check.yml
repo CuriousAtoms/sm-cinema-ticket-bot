@@ -1,17 +1,42 @@
 name: SM Cinema Ticket Checker
 
 on:
-  # Run automatically every 5 minutes
-  # GitHub Actions schedule uses UTC. UTC+8 (Manila) is 8 hours ahead.
+  # The cron is only a STARTER, not the cadence.
+  #
+  # GitHub runs `schedule` on a best-effort queue and drops most of a
+  # high-frequency cron on free/public repos. A declared "*/5 * * * *" was
+  # actually delivering a run every ~148 minutes (median, measured over 65
+  # hours), with the worst gap at 5h30m — 22 of an expected 774 runs, 2.8%.
+  # For a bot whose entire job is catching a ticket drop quickly, that is the
+  # difference between 5 minutes late and half a day late.
+  #
+  # So the real 5-minute cadence comes from the loop inside the job below,
+  # which a late start cannot stretch. The cron just needs to land often
+  # enough that a run is always queued and ready to take over.
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "0 * * * *"
 
   # Allow manual trigger from the GitHub Actions web UI
   workflow_dispatch:
 
+# One checker at a time. Runs are long, so without this an hourly cron would
+# pile up six overlapping jobs all pushing state.json at each other.
+#
+# GitHub keeps at most one run pending per group and cancels older pending ones,
+# which is exactly the behaviour wanted here: whenever the active run exits, the
+# most recently queued one starts immediately and coverage stays continuous.
+# The cancelled pending runs are normal and expected, not failures.
+concurrency:
+  group: ticket-checker
+  cancel-in-progress: false
+
 jobs:
   check-tickets:
     runs-on: ubuntu-latest
+
+    # GitHub's hard ceiling for a job is 6 hours; stop short of it so the loop
+    # ends on its own terms rather than being killed mid-iteration.
+    timeout-minutes: 350
 
     # Allow workflow to commit state.json back to repository
     permissions:
@@ -23,6 +48,9 @@ jobs:
         uses: actions/checkout@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Full history: the loop rebases onto the remote before pushing, and
+          # a shallow clone cannot rebase.
+          fetch-depth: 0
 
       # 2. Set up Python runtime
       - name: Set up Python 3.11
@@ -34,19 +62,65 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 4. Run ticket checker
-      - name: Run ticket checker
+      # 4. Check every 5 minutes for as long as this job is allowed to live
+      - name: Run ticket checker on a loop
         env:
           MOVIE_URL: ${{ secrets.MOVIE_URL }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           MENTION: ${{ secrets.MENTION }}
-        run: python checker.py
-
-      # 7. Commit state.json if modified
-      - name: Save state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # 5h40m, comfortably inside timeout-minutes above.
+          deadline=$(( $(date +%s) + 20400 ))
+          iteration=0
+
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            iteration=$(( iteration + 1 ))
+            echo "::group::check #${iteration} — $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+
+            # `bash -e` would abort the whole loop on a non-zero exit, so
+            # capture the status instead of letting it propagate.
+            status=0
+            python checker.py || status=$?
+
+            echo "::endgroup::"
+
+            # Persist state INSIDE the loop, not at job end.
+            #
+            # checker.py sends the alert and advances notify_phase in the same
+            # breath. If that phase only reached the repo when the job ended,
+            # a cancelled or timed-out run would lose it — and the next run
+            # would read the old phase and fire the very same alert again.
+            if ! git diff --quiet -- state.json; then
+              echo "state.json changed — committing"
+              git add state.json
+              git commit -m "chore: update state.json [skip ci]"
+              # keepalive.yml pushes too; rebase rather than fail the run.
+              git pull --rebase --quiet origin main || true
+              git push || echo "::warning::state.json push failed; retrying next iteration"
+            fi
+
+            # A hard failure means something that cannot self-heal: a retired
+            # film ID, schema drift, a rejected token. Soft failures are already
+            # retried inside checker.py and exit 0. So end the run and show red,
+            # rather than looping quietly on a bot that is checking nothing.
+            if [ "$status" -ne 0 ]; then
+              echo "::error::checker.py exited ${status} (hard failure) — ending this run"
+              exit "$status"
+            fi
+
+            sleep 300
+          done
+
+          echo "Reached the ${iteration}-check deadline; the queued run takes over."
+
+      # 5. Safety net: only fires if the final in-loop push did not land
+      - name: Save state
+        if: always()
+        run: |
           git add state.json
           git diff --staged --quiet || git commit -m "chore: update state.json [skip ci]"
-          git push
+          git pull --rebase --quiet origin main || true
+          git push || true
