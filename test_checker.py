@@ -1383,5 +1383,71 @@ class TestResolveFilmTitle(unittest.TestCase):
                 "https://www.smcinema.com/films/X/HO00001619", session=session))
 
 
+class TestPosterThumbnail(unittest.TestCase):
+    """
+    The poster is film-specific, so the gate must recognise the watched film
+    across every valid spelling of MOVIE_URL. An exact URL match did not: a
+    trailing slash was enough to drop the poster from a real alert, and the
+    failure is invisible because Discord renders a missing thumbnail as nothing.
+    """
+
+    @staticmethod
+    def _payload(result=None):
+        return checker.build_discord_payload(
+            result or {"signals_found": ["x"], "film_title": "Avengers: Doomsday"}
+        )
+
+    def _has_thumb(self, movie_url, result=None):
+        with patch.object(checker, "MOVIE_URL", movie_url):
+            return "thumbnail" in self._payload(result)["embeds"][0]
+
+    def test_poster_url_is_the_verified_one(self):
+        """The old value used an invented MD5 directory and 404'd."""
+        self.assertEqual(
+            checker.DEFAULT_POSTER_URL,
+            "https://upload.wikimedia.org/wikipedia/en/e/ee/Avengers_Doomsday_poster.jpg",
+        )
+        self.assertNotIn("/9/98/", checker.DEFAULT_POSTER_URL)
+
+    def test_thumbnail_uses_the_named_constant(self):
+        with patch.object(checker, "MOVIE_URL", checker.DEFAULT_MOVIE_URL):
+            embed = self._payload()["embeds"][0]
+        self.assertEqual(embed["thumbnail"]["url"], checker.DEFAULT_POSTER_URL)
+
+    def test_equivalent_url_spellings_still_get_the_poster(self):
+        """Each of these is the same film, and used to silently lose the poster."""
+        for url in [
+            checker.DEFAULT_MOVIE_URL,
+            checker.DEFAULT_MOVIE_URL + "/",
+            "https://www.smcinema.com/films/Totally-Different-Slug/HO00001619",
+            "https://www.smcinema.com/films/Avengers-Doomsday/ho00001619",
+        ]:
+            self.assertTrue(self._has_thumb(url), url)
+
+    def test_a_different_film_gets_no_poster(self):
+        """Bias the other way: never illustrate an alert with the wrong movie."""
+        self.assertFalse(
+            self._has_thumb("https://www.smcinema.com/films/Fall-2-Deadpoint/HO00001625"))
+
+    def test_result_film_id_wins_over_movie_url(self):
+        """The alert describes the film that was actually checked."""
+        other = {"signals_found": ["x"], "film_id": "HO00001625"}
+        self.assertFalse(self._has_thumb(checker.DEFAULT_MOVIE_URL, other))
+
+        doomsday = {"signals_found": ["x"], "film_id": "HO00001619"}
+        self.assertTrue(self._has_thumb(
+            "https://www.smcinema.com/films/Fall-2-Deadpoint/HO00001625", doomsday))
+
+    def test_blank_movie_url_does_not_crash(self):
+        self.assertFalse(self._has_thumb(""))
+
+    def test_simulated_alert_carries_the_poster(self):
+        """The simulation previews the real alert, poster included."""
+        with patch.object(checker, "MOVIE_URL", checker.DEFAULT_MOVIE_URL):
+            result = checker.build_simulated_result("open", film_title="Avengers: Doomsday")
+            embed = checker.build_discord_payload(result)["embeds"][0]
+        self.assertEqual(embed["thumbnail"]["url"], checker.DEFAULT_POSTER_URL)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -52,6 +52,16 @@ def get_manila_now():
 
 DEFAULT_MOVIE_URL = "https://www.smcinema.com/films/Avengers-Doomsday/HO00001619"
 
+# Poster for DEFAULT_MOVIE_URL's film, shown as the embed thumbnail.
+# upload.wikimedia.org paths are derived from the MD5 of the file name, so they
+# cannot be hand-written — the previous value used an invented hash directory and
+# returned 404, which Discord swallows silently by rendering no thumbnail at all.
+# Resolve a replacement through the API rather than guessing:
+#   https://en.wikipedia.org/w/api.php?action=query&titles=File:<name>&prop=imageinfo&iiprop=url&format=json
+DEFAULT_POSTER_URL = (
+    "https://upload.wikimedia.org/wikipedia/en/e/ee/Avengers_Doomsday_poster.jpg"
+)
+
 # os.environ.get(key, default) only falls back when the key is ABSENT. GitHub
 # Actions always defines `MOVIE_URL: ${{ secrets.MOVIE_URL }}`, and an unset
 # secret expands to an empty string — so the documented default would never
@@ -1231,10 +1241,15 @@ def build_discord_payload(result, is_test=False):
 
     # Only attach the Avengers poster when that is actually the film being
     # watched — otherwise the alert illustrates the wrong movie.
-    if MOVIE_URL == DEFAULT_MOVIE_URL:
-        embed["thumbnail"] = {
-            "url": "https://upload.wikimedia.org/wikipedia/en/9/98/Avengers_Doomsday_poster.jpg"
-        }
+    #
+    # Compare film IDs rather than whole URLs. MOVIE_URL is typed by hand into a
+    # secret and only its trailing film ID is meaningful to the rest of the bot,
+    # so an equally valid spelling — a trailing slash, a different slug, other
+    # casing — would fail an exact string match and silently drop the poster
+    # from a real alert.
+    watched_film_id = (result.get("film_id") or extract_film_id(MOVIE_URL) or "").strip().upper()
+    if watched_film_id == extract_film_id(DEFAULT_MOVIE_URL).upper():
+        embed["thumbnail"] = {"url": DEFAULT_POSTER_URL}
 
     return {
         "content": header_content,
