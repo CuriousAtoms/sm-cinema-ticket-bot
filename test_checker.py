@@ -7,6 +7,7 @@ import os
 import json
 import tempfile
 import unittest
+import unittest.mock
 from unittest.mock import patch
 
 import checker
@@ -1222,6 +1223,164 @@ class TestFilmSwitchResetsPhase(unittest.TestCase):
         self.assertEqual(self._read(),
                          {"notify_phase": "open", "last_status": "available",
                           "film_id": "HO00001619"})
+
+
+class TestSimulatedAlerts(unittest.TestCase):
+    """
+    --simulate-alert previews the real alert before tickets ever go on sale.
+
+    Two properties matter: it must render exactly like a genuine detection, and
+    it must never touch state.json — a preview that advanced notify_phase would
+    burn the transition the real alert depends on.
+    """
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.test_state_file = os.path.join(self.tmp_dir.name, "test_state.json")
+        self._original_state_file = checker.STATE_FILE
+        checker.STATE_FILE = self.test_state_file
+
+    def tearDown(self):
+        checker.STATE_FILE = self._original_state_file
+        self.tmp_dir.cleanup()
+
+    def test_announced_phase_renders_as_advance_booking(self):
+        result = checker.build_simulated_result("announced", film_title="Some Film")
+        payload = checker.build_discord_payload(result)
+        self.assertIn("ADVANCE BOOKING ANNOUNCED", payload["content"])
+        self.assertIn("opens at", payload["embeds"][0]["description"])
+        sched = next(f for f in payload["embeds"][0]["fields"]
+                     if "Booking Schedule" in f["name"])
+        self.assertIn("opens at", sched["value"])
+
+    def test_open_phase_renders_as_tickets_available(self):
+        result = checker.build_simulated_result("open", film_title="Some Film")
+        payload = checker.build_discord_payload(result)
+        self.assertIn("TICKETS ARE NOW AVAILABLE", payload["content"])
+        self.assertIn("open now", payload["embeds"][0]["description"])
+        sched = next(f for f in payload["embeds"][0]["fields"]
+                     if "Booking Schedule" in f["name"])
+        self.assertIn("open now", sched["value"])
+
+    def test_simulated_alert_is_labelled_as_simulated(self):
+        """The one deliberate tell: nobody should mistake a preview for the real thing."""
+        for phase in checker.SIMULATED_PHASES:
+            payload = checker.build_discord_payload(
+                checker.build_simulated_result(phase, film_title="Some Film")
+            )
+            signals = next(f for f in payload["embeds"][0]["fields"]
+                           if "Signals Detected" in f["name"])
+            self.assertIn("SIMULATED", signals["value"], phase)
+
+    def test_simulated_result_shape_matches_a_real_detection(self):
+        """build_discord_payload must not be able to tell the two apart."""
+        real_keys = {
+            "status", "available", "signals_found", "unavailable_signals",
+            "page_title", "error_reason", "hard", "startsAt", "starts_at",
+            "film_title", "film_id",
+        }
+        self.assertEqual(set(checker.build_simulated_result("open")), real_keys)
+
+    def test_unknown_phase_is_rejected(self):
+        with self.assertRaises(ValueError):
+            checker.build_simulated_result("both")
+
+    def test_mention_is_included_at_full_fidelity(self):
+        with patch.object(checker, "MENTION", "@everyone"):
+            payload = checker.build_discord_payload(
+                checker.build_simulated_result("open", film_title="Some Film")
+            )
+        self.assertIn("@everyone", payload["content"])
+
+    def test_simulation_never_writes_state(self):
+        """The regression this guards: a preview burning the real alert's phase."""
+        with patch.object(checker, "WEBHOOK_URL", "https://discord.com/api/webhooks/x/y"),  \
+             patch.object(checker, "verify_webhook", return_value=True),  \
+             patch.object(checker, "resolve_film_title", return_value="Some Film"),  \
+             patch.object(checker, "send_discord_notification", return_value=True) as notify,  \
+             patch.object(checker.time, "sleep"),  \
+             patch.object(checker, "check_availability") as check,  \
+             patch.object(checker, "save_state") as save:
+            checker.main(["--simulate-alert", "both"])
+
+        self.assertEqual(notify.call_count, 2)
+        save.assert_not_called()
+        check.assert_not_called()
+        self.assertFalse(os.path.exists(self.test_state_file))
+
+    def test_both_sends_announced_before_open(self):
+        sent = []
+        with patch.object(checker, "verify_webhook", return_value=True),  \
+             patch.object(checker, "resolve_film_title", return_value="Some Film"),  \
+             patch.object(checker.time, "sleep"),  \
+             patch.object(checker, "send_discord_notification",
+                          side_effect=lambda r, **kw: sent.append(r) or True):
+            checker.main(["--simulate-alert", "both"])
+
+        headers = [checker.build_discord_payload(r)["content"] for r in sent]
+        self.assertIn("ADVANCE BOOKING ANNOUNCED", headers[0])
+        self.assertIn("TICKETS ARE NOW AVAILABLE", headers[1])
+
+    def test_single_phase_sends_one_alert(self):
+        with patch.object(checker, "verify_webhook", return_value=True),  \
+             patch.object(checker, "resolve_film_title", return_value="Some Film"),  \
+             patch.object(checker, "send_discord_notification", return_value=True) as notify:
+            checker.main(["--simulate-alert", "open"])
+        self.assertEqual(notify.call_count, 1)
+
+    def test_dead_webhook_exits_non_zero_without_sending(self):
+        with patch.object(checker, "verify_webhook", return_value=False),  \
+             patch.object(checker, "send_discord_notification") as notify:
+            with self.assertRaises(SystemExit) as ctx:
+                checker.main(["--simulate-alert", "both"])
+        self.assertEqual(ctx.exception.code, 1)
+        notify.assert_not_called()
+
+    def test_failed_send_exits_non_zero(self):
+        """A silent green run would look identical to a delivered alert."""
+        with patch.object(checker, "verify_webhook", return_value=True),  \
+             patch.object(checker, "resolve_film_title", return_value="Some Film"),  \
+             patch.object(checker.time, "sleep"),  \
+             patch.object(checker, "send_discord_notification", return_value=False):
+            with self.assertRaises(SystemExit) as ctx:
+                checker.main(["--simulate-alert", "both"])
+        self.assertEqual(ctx.exception.code, 1)
+
+
+class TestResolveFilmTitle(unittest.TestCase):
+    """Title lookup for a simulation is best-effort and must never raise."""
+
+    def test_returns_title_on_the_happy_path(self):
+        html = ('<script id="__NEXT_DATA__" type="application/json">'
+                '{"props":{"pageProps":{"environment":{"gasToken":"tok"}}}}</script>')
+        session = unittest.mock.Mock()
+        session.get.return_value = MockResponse(200, text=html)
+        with patch.object(checker, "fetch_film_title", return_value="Some Film"):
+            self.assertEqual(
+                checker.resolve_film_title(
+                    "https://www.smcinema.com/films/X/HO00001619", session=session),
+                "Some Film",
+            )
+
+    def test_bad_film_id_returns_none_without_a_request(self):
+        session = unittest.mock.Mock()
+        self.assertIsNone(
+            checker.resolve_film_title("https://www.smcinema.com/films/X", session=session))
+        session.get.assert_not_called()
+
+    def test_network_error_returns_none(self):
+        session = unittest.mock.Mock()
+        session.get.side_effect = Exception("boom")
+        self.assertIsNone(
+            checker.resolve_film_title(
+                "https://www.smcinema.com/films/X/HO00001619", session=session))
+
+    def test_missing_gas_token_returns_none(self):
+        session = unittest.mock.Mock()
+        session.get.return_value = MockResponse(200, text="<html>no next data</html>")
+        self.assertIsNone(
+            checker.resolve_film_title(
+                "https://www.smcinema.com/films/X/HO00001619", session=session))
 
 
 if __name__ == "__main__":

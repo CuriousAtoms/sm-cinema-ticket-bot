@@ -566,6 +566,50 @@ def fetch_film_title(film_id, gas_token, session, timeout=15):
         return None
 
 
+def resolve_film_title(movie_url=None, session=None):
+    """
+    Resolve a film's title on its own, without running an availability check.
+
+    Walks the same two hops the real check does (page HTML -> gasToken ->
+    /ocapi/v1/films/<id>) so a simulated alert names the film exactly as a
+    genuine one would. Best-effort: returns None on any failure, because a
+    preview is still worth sending without the title.
+    """
+    target = movie_url or MOVIE_URL
+    film_id = extract_film_id(target)
+    if not film_id or not looks_like_film_id(film_id):
+        return None
+
+    # `requests` is only needed to build a session of our own — an injected one
+    # works without it.
+    if session is None:
+        if requests is None:
+            return None
+        session = requests.Session()
+    sess = session
+    try:
+        resp = sess.get(
+            target,
+            headers={
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=15,
+        )
+    except Exception:
+        return None
+
+    if getattr(resp, "status_code", None) != 200:
+        return None
+
+    gas_token = extract_gas_token(resp.text)
+    if not gas_token:
+        return None
+
+    return fetch_film_title(film_id, gas_token, sess)
+
+
 def extract_gas_token(html_text: str):
     """
     Extract the JWT gasToken from <script id="__NEXT_DATA__" type="application/json">.
@@ -1198,6 +1242,55 @@ def build_discord_payload(result, is_test=False):
     }
 
 
+# ── Simulated Alerts ────────────────────────────────────────────────────
+
+SIMULATED_PHASES = ("announced", "open")
+
+SIMULATED_SIGNAL = "SIMULATED ALERT (--simulate-alert) — not a real detection"
+
+
+def build_simulated_result(phase, film_title=None, now=None):
+    """
+    Build a result dict that renders as a genuine alert for the given phase.
+
+    Fidelity is the whole point: this returns the same keys
+    _check_availability_api_single() returns, so build_discord_payload() cannot
+    tell a simulation from a real detection and the preview matches what will
+    actually land in the channel. The one deliberate tell is the signals line,
+    which always says the alert was simulated.
+
+      'announced' -> startsAt a week out    -> "ADVANCE BOOKING ANNOUNCED!"
+      'open'      -> startsAt two hours ago -> "TICKETS ARE NOW AVAILABLE!"
+    """
+    if phase not in SIMULATED_PHASES:
+        raise ValueError(
+            f"unknown simulated phase {phase!r} (expected one of {SIMULATED_PHASES})"
+        )
+
+    reference = now or get_manila_now()
+    if phase == "announced":
+        starts_at = (reference + timedelta(days=7)).replace(
+            hour=10, minute=0, second=0, microsecond=0
+        )
+    else:
+        starts_at = reference - timedelta(hours=2)
+
+    starts_at_iso = starts_at.isoformat()
+    return {
+        "status": "AVAILABLE",
+        "available": True,
+        "signals_found": [SIMULATED_SIGNAL],
+        "unavailable_signals": [],
+        "page_title": "SM Cinema",
+        "error_reason": None,
+        "hard": False,
+        "startsAt": starts_at_iso,
+        "starts_at": starts_at_iso,
+        "film_title": film_title,
+        "film_id": extract_film_id(MOVIE_URL),
+    }
+
+
 # ── Webhook Preflight Diagnostics ─────────────────────────────────────────────
 
 WEBHOOK_URL_RE = re.compile(
@@ -1356,6 +1449,43 @@ def send_discord_notification(result, is_test=False):
         return False
 
 
+def simulate_alert(phases, session=None):
+    """
+    Fire real-looking availability alerts into Discord without a real detection.
+
+    Deliberately never loads or writes state.json. A preview that advanced
+    notify_phase would burn the very transition the genuine alert depends on,
+    and the real "tickets are open" message would then never be sent.
+
+    Returns True only if every requested alert was accepted by Discord.
+    """
+    print("[SIMULATE] Verifying Discord webhook configuration...")
+    if not verify_webhook(session=session):
+        print("\n[SIMULATE] ❌ Webhook is not usable — nothing sent. Fix the above, then re-run.")
+        return False
+
+    film_title = resolve_film_title(session=session)
+    # Kept out of the f-string expression: a backslash escape inside one is a
+    # syntax error before Python 3.12, and the workflows pin 3.11.
+    title_label = film_title or 'unknown (the alert will say "this movie")'
+    print(f"\n[SIMULATE] Film: {title_label}")
+    print(f"[SIMULATE] Mention: {MENTION or '(none — no one will be pinged)'}")
+    print("[SIMULATE] state.json is neither read nor written by a simulation.")
+
+    all_sent = True
+    for index, phase in enumerate(phases):
+        if index:
+            # Discord orders by arrival; a beat apart keeps the two embeds in
+            # the sequence a real run would have produced them.
+            time.sleep(2)
+        print(f"\n[SIMULATE] Sending '{phase}' alert...")
+        result = build_simulated_result(phase, film_title=film_title)
+        if not send_discord_notification(result):
+            all_sent = False
+
+    return all_sent
+
+
 # ── Main Entry Point ───────────────────────────────────────────────────────────
 
 def main(argv=None):
@@ -1369,6 +1499,16 @@ def main(argv=None):
         "--list-films",
         action="store_true",
         help="List every film currently on SM Cinema with its film ID, and exit",
+    )
+    parser.add_argument(
+        "--simulate-alert",
+        choices=("announced", "open", "both"),
+        help=(
+            "Send a real-looking availability alert to Discord without a real "
+            "detection, then exit. Renders identically to the genuine alert, "
+            "MENTION included, so it pings exactly as the real one would. "
+            "Never reads or writes state.json."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -1393,6 +1533,20 @@ def main(argv=None):
             {"signals_found": ["CLI --test-discord trigger"]},
             is_test=True,
         )
+        return
+
+    if args.simulate_alert:
+        phases = (
+            SIMULATED_PHASES
+            if args.simulate_alert == "both"
+            else (args.simulate_alert,)
+        )
+        print(f"[SIMULATE] Simulating alert phase(s): {', '.join(phases)}")
+        print("[SIMULATE] These are previews — tickets have NOT actually been detected.")
+        if not simulate_alert(phases):
+            print(f"\n{'='*60}\n")
+            sys.exit(1)
+        print(f"\n{'='*60}\n")
         return
 
     state = load_state()

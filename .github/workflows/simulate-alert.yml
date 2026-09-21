@@ -1,0 +1,56 @@
+name: Simulate Ticket Alert
+
+# Manual only. Fires a real-looking availability alert into Discord so the alert
+# itself can be reviewed long before tickets actually go on sale — the genuine
+# event cannot be scheduled, so this is the only way to see it.
+#
+# Declares `contents: read` deliberately: a simulation must never be able to
+# write state.json. Advancing notify_phase here would burn the very transition
+# the real alert depends on, and the genuine "tickets are open" message would
+# then never be sent.
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "Which alert to simulate"
+        type: choice
+        required: true
+        default: both
+        options:
+          - both
+          - announced
+          - open
+      mention:
+        description: "Include the MENTION ping, exactly as the real alert would"
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  simulate-alert:
+    runs-on: ubuntu-latest
+
+    # Read-only: this workflow must never write state.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Send simulated alert
+        env:
+          MOVIE_URL: ${{ secrets.MOVIE_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # Unticking `mention` blanks the secret for this run only, so the embed
+          # is identical but nobody is pinged.
+          MENTION: ${{ inputs.mention && secrets.MENTION || '' }}
+        run: python checker.py --simulate-alert "${{ inputs.phase }}"

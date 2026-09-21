@@ -84,6 +84,41 @@ python checker.py --test-discord
 
 ---
 
+## 🧪 Previewing the Real Alert Before Tickets Exist
+
+`--test-discord` proves the webhook works, but it sends the blue 🧪 test embed — not
+the alert people will actually receive. The genuine event cannot be scheduled, so
+while the film is still `ComingSoon` the only way to review the real thing is to
+simulate it.
+
+Run the **Simulate Ticket Alert** workflow (Actions tab → *Simulate Ticket Alert*
+→ **Run workflow**):
+
+| Input | Effect |
+|---|---|
+| `phase: announced` | Sends 🚨 **ADVANCE BOOKING ANNOUNCED!** with a `startsAt` one week out. |
+| `phase: open` | Sends 🚨 **TICKETS ARE NOW AVAILABLE!** with a `startsAt` two hours ago. |
+| `phase: both` | Sends both, in the order a real run would have produced them. |
+| `mention: true` | Includes the `MENTION` ping — lands exactly as the real alert will. |
+| `mention: false` | Blanks `MENTION` for that run only: identical embed, nobody pinged. |
+
+The simulation renders through the same `build_discord_payload()` as a genuine
+detection, so what you see is what you will get. The one deliberate tell is the
+**Signals Detected** field, which always reads
+`SIMULATED ALERT (--simulate-alert) — not a real detection`.
+
+It is safe to run at any time. The workflow declares `contents: read`, and
+`--simulate-alert` never loads or writes `state.json` — so a preview cannot
+advance `notify_phase` and swallow the real alert when tickets actually go live.
+
+The same thing runs locally once `DISCORD_WEBHOOK_URL` is exported:
+
+```bash
+python checker.py --simulate-alert both     # or: announced / open
+```
+
+---
+
 ## 🎯 Pointing the Bot at a Different Movie
 
 `MOVIE_URL` **must end with the SM Cinema film ID** (`HO` + 8 digits). The film ID is
@@ -212,6 +247,7 @@ previous film's `"open"` phase and silently swallow the alert. `film_id` is adde
 │       ├── check.yml           # 5-minute cron scheduler (lightweight JSON API)
 │       ├── check-browser.yml   # Manual trigger for browser fallback verification
 │       ├── verify-webhook.yml  # Manual Discord webhook preflight (read-only)
+│       ├── simulate-alert.yml  # Manual real-looking alert preview (read-only)
 │       ├── keepalive.yml       # Monthly commit so the cron is not auto-disabled
 │       └── tests.yml           # Unit tests on every push (stdlib unittest)
 ├── .gitignore                  # Ignored files
