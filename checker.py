@@ -1373,11 +1373,18 @@ def verify_webhook(url=None, session=None):
     if not (target or "").strip():
         return False
 
-    if requests is None:
-        print("[DISCORD]   (skipping live check — 'requests' not installed)")
-        return False
+    # `requests` is only needed to build a request of our own — an injected
+    # session works without it. Checking the global first made the live check
+    # untestable in any environment that has not installed it, which is exactly
+    # what tests.yml is: it deliberately installs nothing, because the decision
+    # logic is pure.
+    if session is None:
+        if requests is None:
+            print("[DISCORD]   (skipping live check — 'requests' not installed)")
+            return False
+        session = requests
 
-    sess = session or requests
+    sess = session
     try:
         resp = sess.get(target.strip(), timeout=10)
     except Exception as e:

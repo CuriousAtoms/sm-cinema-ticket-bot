@@ -1449,5 +1449,62 @@ class TestPosterThumbnail(unittest.TestCase):
         self.assertEqual(embed["thumbnail"]["url"], checker.DEFAULT_POSTER_URL)
 
 
+class TestInjectedSessionWorksWithoutRequests(unittest.TestCase):
+    """
+    tests.yml deliberately installs nothing — the decision logic is pure, so the
+    suite needs no dependencies. That makes `requests` absent on CI, and any
+    helper that checks the global before honouring an injected session becomes
+    untestable there and fails the run. verify_webhook did exactly that, and the
+    Tests workflow was red for a day before anyone noticed.
+
+    These pin the contract: an injected session is sufficient on its own.
+    """
+
+    GOOD = "https://discord.com/api/webhooks/123456789012345678/" + ("t" * 68)
+
+    def test_verify_webhook_honours_an_injected_session(self):
+        session = unittest.mock.Mock()
+        session.get.return_value = MockResponse(
+            200, json_data={"name": "hook", "channel_id": "1"})
+        with patch.object(checker, "requests", None):
+            self.assertTrue(checker.verify_webhook(self.GOOD, session=session))
+        session.get.assert_called_once()
+
+    def test_verify_webhook_still_declines_when_it_must_build_its_own(self):
+        """With no session AND no requests, there is genuinely nothing to send with."""
+        with patch.object(checker, "requests", None):
+            self.assertFalse(checker.verify_webhook(self.GOOD))
+
+    def test_resolve_film_title_honours_an_injected_session(self):
+        html = ('<script id="__NEXT_DATA__" type="application/json">'
+                '{"props":{"pageProps":{"environment":{"gasToken":"tok"}}}}</script>')
+        session = unittest.mock.Mock()
+        session.get.return_value = MockResponse(200, text=html)
+        with patch.object(checker, "requests", None),  \
+             patch.object(checker, "fetch_film_title", return_value="Some Film"):
+            self.assertEqual(
+                checker.resolve_film_title(
+                    "https://www.smcinema.com/films/X/HO00001619", session=session),
+                "Some Film",
+            )
+
+    def test_every_session_helper_guards_the_same_way(self):
+        """
+        The guard belongs inside `if session is None`. Checking the module-level
+        `requests` first is the bug; catch a regression at the source level
+        rather than waiting for a red CI run.
+        """
+        import inspect
+        for fn in (checker.verify_webhook, checker.resolve_film_title,
+                   checker.list_films, checker._check_availability_api_single):
+            src = inspect.getsource(fn)
+            if "requests is None" not in src:
+                continue
+            before = src.split("requests is None")[0]
+            self.assertIn("if session is None:", before,
+                          "%s checks the global `requests` before honouring an "
+                          "injected session" % fn.__name__)
+
+
 if __name__ == "__main__":
     unittest.main()
