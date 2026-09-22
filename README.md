@@ -162,6 +162,59 @@ python checker.py --simulate-alert both     # or: announced / open
 
 ---
 
+## 🔬 End-to-End Detection Test
+
+`--simulate-alert` builds its result by hand. That makes it perfect for checking
+how the message *looks*, and useless for checking whether the bot would ever
+*decide* to send one — it skips `evaluate_availability`,
+`determine_booking_phase` and the `notify_phase` state machine entirely.
+
+Those three only ever run in production against a film that says `ComingSoon`,
+so the "yes, alert" branch can sit unexercised for months. The **End-to-End
+Detection Test** workflow closes that gap by pointing the real checker at a film
+whose tickets are genuinely on sale:
+
+```bash
+gh workflow run detect-test.yml \
+  -f film_url="https://www.smcinema.com/films/Fall-2-Deadpoint/HO00001625" \
+  -f mention=false
+```
+
+Nothing is faked. The live API returns a real "available" payload, the real
+decision logic reaches its own verdict, and a real alert is sent — so the
+Discord message is *true*: it names that film, whose tickets really are
+available. Find a film to point it at with `python checker.py --list-films`.
+
+| | `--simulate-alert` | `detect-test.yml` |
+|---|---|---|
+| Availability payload | fabricated | live from the API |
+| `evaluate_availability` | skipped | runs |
+| `determine_booking_phase` | skipped | runs |
+| `notify_phase` transition | skipped | runs |
+| Discord message | marked `SIMULATED ALERT` | a real, true alert |
+
+### Why it cannot corrupt the real alert
+
+A positive detection is exactly the thing that advances `notify_phase`, and a
+leaked `"notify_phase": "open"` would silently swallow the genuine alert when
+tickets finally drop. So three independent guards apply, not one:
+
+1. `permissions: contents: read` — the job structurally cannot push.
+2. `STATE_FILE` points outside the workspace, so `state.json` is never written.
+3. There is no "Save state" step in this workflow at all.
+
+A final step then asserts the committed `state.json` is byte-identical
+afterwards, and fails the run if it is not:
+
+```
+state.json unchanged -- the real alert is still armed.
+```
+
+A fresh `STATE_FILE` each run also means the `none -> open` transition actually
+fires, instead of being skipped as already-notified.
+
+---
+
 ## 🎯 Pointing the Bot at a Different Movie
 
 `MOVIE_URL` **must end with the SM Cinema film ID** (`HO` + 8 digits). The film ID is
@@ -291,6 +344,7 @@ previous film's `"open"` phase and silently swallow the alert. `film_id` is adde
 │       ├── check-browser.yml   # Manual trigger for browser fallback verification
 │       ├── verify-webhook.yml  # Manual Discord webhook preflight (read-only)
 │       ├── simulate-alert.yml  # Manual real-looking alert preview (read-only)
+│       ├── detect-test.yml     # Manual end-to-end positive detection (read-only)
 │       ├── keepalive.yml       # Monthly commit so the cron is not auto-disabled
 │       └── tests.yml           # Unit tests on every push (stdlib unittest)
 ├── .gitignore                  # Ignored files
