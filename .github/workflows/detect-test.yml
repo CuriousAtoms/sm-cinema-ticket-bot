@@ -1,0 +1,92 @@
+name: End-to-End Detection Test
+
+# Manual only. Runs the REAL checker -- no flags, no fakes -- against a film
+# whose tickets are genuinely on sale, so the actual decision path executes:
+# page fetch -> gasToken -> availability API -> evaluate_availability ->
+# determine_booking_phase -> the notify_phase state machine -> Discord.
+#
+# This is what --simulate-alert deliberately cannot test. A simulation builds
+# its result by hand and never runs the decision logic or the state machine;
+# this runs both against a live payload that really does say "available".
+#
+# The watched film is ComingSoon for months at a time, so the only way to
+# exercise a positive detection is to point the checker at a different film
+# that is already on sale. That makes the resulting Discord alert TRUE: it
+# names that film, and that film's tickets really are available.
+#
+# Three independent guards keep this away from the real notification state,
+# because a leaked "notify_phase": "open" would swallow the genuine alert:
+#   1. contents: read -- the job structurally cannot push.
+#   2. STATE_FILE points outside the repo, so state.json is never even written.
+#   3. No "Save state" step exists here at all.
+# The final step asserts the repo's state.json is still untouched.
+on:
+  workflow_dispatch:
+    inputs:
+      film_url:
+        description: "Film page URL to check (must end in the HO######## film ID)"
+        type: string
+        required: true
+        default: "https://www.smcinema.com/films/ALWAYS-LALISA/HO00001651"
+      mention:
+        description: "Include the MENTION ping (off by default: this alert names a film you are not tracking)"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  detect-test:
+    runs-on: ubuntu-latest
+
+    # Read-only: this workflow must never write state.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Record the committed state before the run
+        id: before
+        run: |
+          echo "sha=$(sha256sum state.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "Committed state.json going in:"
+          cat state.json
+
+      - name: Run the real checker against a film that is on sale
+        env:
+          MOVIE_URL: ${{ inputs.film_url }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          MENTION: ${{ inputs.mention && secrets.MENTION || '' }}
+          # Outside the workspace: the real state.json must not even be written,
+          # let alone committed. A fresh path also means the run starts from
+          # notify_phase "none", so the none -> open transition actually fires
+          # instead of being skipped as already-notified.
+          STATE_FILE: ${{ runner.temp }}/state-detect-test.json
+        run: python checker.py
+
+      - name: Show the state the test wrote, and prove the repo's is untouched
+        if: always()
+        run: |
+          echo "=== state the test wrote (outside the repo) ==="
+          cat "${{ runner.temp }}/state-detect-test.json" 2>/dev/null || echo "(none written)"
+
+          echo
+          echo "=== repo state.json ==="
+          cat state.json
+
+          after=$(sha256sum state.json | cut -d' ' -f1)
+          if [ "$after" != "${{ steps.before.outputs.sha }}" ]; then
+            echo "::error::state.json was modified by a read-only test run"
+            exit 1
+          fi
+          echo
+          echo "state.json unchanged -- the real alert is still armed."
