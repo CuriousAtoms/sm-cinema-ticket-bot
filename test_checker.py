@@ -13,6 +13,25 @@ from unittest.mock import patch
 import checker
 
 
+# Tests must never sleep. On GitHub Actions main() waits up to 60s before its
+# first check to spread cron load, and CI once spent 74s of a sub-second suite
+# doing exactly that.
+_no_jitter = patch.dict(os.environ, {"SKIP_INITIAL_DELAY": "1"})
+
+
+def setUpModule():
+    _no_jitter.start()
+
+
+def tearDownModule():
+    _no_jitter.stop()
+
+
+def stored_film(film_id="HO00001619"):
+    """One film's state as main() left it in checker.STATE_FILE, defaults filled in."""
+    return checker.load_state().get(film_id, dict(checker.DEFAULT_FILM_STATE))
+
+
 class TestEvaluateSignals(unittest.TestCase):
     """Unit tests covering the pure decision logic in evaluate_signals()."""
 
@@ -275,40 +294,35 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
         }):
             checker.main([])
 
-        with open(self.test_state_file, "r", encoding="utf-8") as f:
-            after = json.load(f)
-        self.assertEqual(after["notify_phase"], "none")
-        self.assertEqual(after["last_status"], "unavailable")
+        self.assertEqual(stored_film()["notify_phase"], "none")
+        self.assertEqual(stored_film()["last_status"], "unavailable")
 
     def test_legacy_state_migration(self):
         """Legacy boolean 'notified' is migrated correctly on load, and save drops 'notified'."""
-        # Case 1: notified=True -> notify_phase="open"
+        # Case 1: notified=True -> notify_phase="open", for MOVIE_URL's film
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump({"notified": True, "last_status": "available"}, f)
         loaded = checker.load_state()
-        self.assertEqual(loaded["notify_phase"], "open")
-        self.assertEqual(loaded["last_status"], "available")
+        self.assertEqual(loaded["HO00001619"]["notify_phase"], "open")
+        self.assertEqual(loaded["HO00001619"]["last_status"], "available")
 
-        # Case 2: notified=False -> notify_phase="none"
+        # Case 2: notified=False -> nothing recorded at all
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump({"notified": False, "last_status": "unavailable"}, f)
-        loaded = checker.load_state()
-        self.assertEqual(loaded["notify_phase"], "none")
-        self.assertEqual(loaded["last_status"], "unavailable")
+        self.assertEqual(checker.load_state(), {})
 
         # Case 3: Invalid notify_phase defaults to "none"
         with open(self.test_state_file, "w", encoding="utf-8") as f:
             json.dump({"notify_phase": "invalid_value", "last_status": "unavailable"}, f)
-        loaded = checker.load_state()
-        self.assertEqual(loaded["notify_phase"], "none")
+        self.assertEqual(checker.load_state(), {})
 
         # Case 4: save_state only writes notify_phase and last_status
-        checker.save_state({"notify_phase": "announced", "last_status": "available", "notified": True, "extra": 123})
+        checker.save_state({"HO00001619": {"notify_phase": "announced", "last_status": "available",
+                                           "notified": True, "extra": 123}})
         with open(self.test_state_file, "r", encoding="utf-8") as f:
             saved = json.load(f)
-        self.assertEqual(saved, {"notify_phase": "announced", "last_status": "available"})
-        self.assertNotIn("notified", saved)
-        self.assertNotIn("extra", saved)
+        self.assertEqual(saved, {"films": {"HO00001619": {"notify_phase": "announced",
+                                                          "last_status": "available"}}})
 
     def test_determine_booking_phase(self):
         """determine_booking_phase correctly classifies future startsAt vs past/none."""
@@ -362,7 +376,8 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
             self.assertEqual(mock_notify.call_count, 1)
             with open(self.test_state_file, "r", encoding="utf-8") as f:
                 state1 = json.load(f)
-            self.assertEqual(state1, {"notify_phase": "announced", "last_status": "available", "film_id": "HO00001619"})
+            self.assertEqual(state1, {"films": {"HO00001619": {"notify_phase": "announced",
+                                                                "last_status": "available"}}})
 
             # Intermediate run: Still announced (future) -> should skip
             mtime_before_skip1 = os.path.getmtime(self.test_state_file)
@@ -379,7 +394,8 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
             self.assertEqual(mock_notify.call_count, 2)
             with open(self.test_state_file, "r", encoding="utf-8") as f:
                 state2 = json.load(f)
-            self.assertEqual(state2, {"notify_phase": "open", "last_status": "available", "film_id": "HO00001619"})
+            self.assertEqual(state2, {"films": {"HO00001619": {"notify_phase": "open",
+                                                                "last_status": "available"}}})
 
             # Run 3: Next run (still open) -> must skip and write nothing
             mtime_before_skip2 = os.path.getmtime(self.test_state_file)
@@ -411,7 +427,8 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
 
             self.assertEqual(mock_notify.call_count, 1)
             with open(self.test_state_file, "r", encoding="utf-8") as f:
-                self.assertEqual(json.load(f), {"notify_phase": "open", "last_status": "available", "film_id": "HO00001619"})
+                self.assertEqual(json.load(f), {"films": {"HO00001619": {"notify_phase": "open",
+                                                                         "last_status": "available"}}})
 
             # 2nd run: still open -> 0 notifications
             mtime_before = os.path.getmtime(self.test_state_file)
@@ -451,14 +468,15 @@ class TestStateManagementAndWorkflowSafety(unittest.TestCase):
             with patch.object(checker, "check_availability", return_value=res_unavail):
                 checker.main([])
             with open(self.test_state_file, "r", encoding="utf-8") as f:
-                self.assertEqual(json.load(f), {"notify_phase": "none", "last_status": "unavailable", "film_id": "HO00001619"})
+                self.assertEqual(json.load(f), {"films": {}})
 
             # 3. Available again -> notifies a 2nd time!
             with patch.object(checker, "check_availability", return_value=res_avail):
                 checker.main([])
             self.assertEqual(mock_notify.call_count, 2)
             with open(self.test_state_file, "r", encoding="utf-8") as f:
-                self.assertEqual(json.load(f), {"notify_phase": "open", "last_status": "available", "film_id": "HO00001619"})
+                self.assertEqual(json.load(f), {"films": {"HO00001619": {"notify_phase": "open",
+                                                                         "last_status": "available"}}})
 
 
 class TestUserAgentNormalisation(unittest.TestCase):
@@ -1002,8 +1020,7 @@ class TestFailedSendStaysRetryable(unittest.TestCase):
     }
 
     def _phase(self):
-        with open(self.test_state_file, "r", encoding="utf-8") as f:
-            return json.load(f)["notify_phase"]
+        return stored_film()["notify_phase"]
 
     def test_failed_send_does_not_advance_phase(self):
         """A rejected webhook (404 Unknown Webhook) must leave the phase retryable."""
@@ -1158,7 +1175,10 @@ class TestFilmSwitchResetsPhase(unittest.TestCase):
                           return_value=self._available("HO00001619")):
             checker.main([])
             self.assertEqual(notify.call_count, 1)
-        self.assertEqual(self._read()["film_id"], "HO00001619")
+        films = self._read()["films"]
+        self.assertEqual(films["HO00001619"]["notify_phase"], "open")
+        # The old film's "open" stayed with the old film instead of being inherited.
+        self.assertEqual(films["HO00001625"]["notify_phase"], "open")
 
     def test_same_film_still_suppresses_duplicates(self):
         """The reset must be film-specific, not a blanket re-alert."""
@@ -1175,19 +1195,22 @@ class TestFilmSwitchResetsPhase(unittest.TestCase):
         with patch.object(checker, "WEBHOOK_URL", "https://discord.com/api/webhooks/x/y"),              patch.object(checker, "send_discord_notification", return_value=True),              patch.object(checker, "check_availability",
                           return_value=self._available("HO00001619")):
             checker.main([])
-        self.assertEqual(self._read()["film_id"], "HO00001619")
+        self.assertIn("HO00001619", self._read()["films"])
 
     def test_legacy_state_without_film_id_loads_cleanly(self):
+        """It predates film tracking, so it can only have been MOVIE_URL's film."""
         self._write({"notify_phase": "announced", "last_status": "available"})
         loaded = checker.load_state()
-        self.assertEqual(loaded["notify_phase"], "announced")
-        self.assertIsNone(loaded["film_id"])
+        self.assertEqual(loaded["HO00001619"]["notify_phase"], "announced")
 
-    def test_save_state_omits_film_id_when_unknown(self):
-        """Never write a null film_id — keep the file to the keys that mean something."""
-        checker.save_state({"notify_phase": "none", "last_status": "unavailable",
-                            "film_id": None})
-        self.assertNotIn("film_id", self._read())
+    def test_save_state_leaves_out_films_with_nothing_recorded(self):
+        """Keep the file to the entries that mean something."""
+        checker.save_state({
+            "HO00001619": dict(checker.DEFAULT_FILM_STATE),
+            "HO00001625": {"notify_phase": "open", "last_status": "available", "alerted_sites": None},
+        })
+        self.assertEqual(self._read(), {"films": {"HO00001625": {"notify_phase": "open",
+                                                                  "last_status": "available"}}})
 
     def test_doomsday_full_lifecycle_after_switching_from_fall_2(self):
         """
@@ -1221,8 +1244,10 @@ class TestFilmSwitchResetsPhase(unittest.TestCase):
                 self.assertEqual(notify.call_count, expected_calls, label)
 
         self.assertEqual(self._read(),
-                         {"notify_phase": "open", "last_status": "available",
-                          "film_id": "HO00001619"})
+                         {"films": {"HO00001619": {"notify_phase": "open",
+                                                   "last_status": "available"},
+                                    "HO00001625": {"notify_phase": "open",
+                                                   "last_status": "available"}}})
 
 
 class TestSimulatedAlerts(unittest.TestCase):
@@ -1503,7 +1528,8 @@ class TestInjectedSessionWorksWithoutRequests(unittest.TestCase):
         """
         import inspect
         for fn in (checker.verify_webhook, checker.resolve_film_title,
-                   checker.list_films, checker._check_availability_api_single):
+                   checker.list_films, checker._check_availability_api_single,
+                   checker.watched_films):
             src = inspect.getsource(fn)
             if "requests is None" not in src:
                 continue
@@ -1574,16 +1600,18 @@ class FakeDigitalApi:
     Enforces the real API's rules where they matter — siteIds is required and
     capped at five per request — and answers only for the cinemas asked about.
     `screenings` maps site ID -> business dates; `seats` maps site ID ->
-    showtimeAvailabilities; `fail` maps an endpoint path -> the response (or
-    exception) it should produce instead.
+    showtimeAvailabilities; `listing` is the (film ID, title) pairs /films
+    returns; `fail` maps an endpoint path -> the response (or exception) it
+    should produce instead.
     """
 
     PAGE = ('<script id="__NEXT_DATA__" type="application/json">'
             '{"props":{"pageProps":{"environment":{"gasToken":"tok"}}}}</script>')
 
     def __init__(self, categories=("ComingSoon",), sites=None, screenings=None,
-                 seats=None, fail=None):
+                 seats=None, fail=None, listing=()):
         self.categories = list(categories)
+        self.listing = list(listing)
         if sites is None:
             # The real three, padded out to the real count of 78 cinemas.
             sites = dict(REAL_CINEMAS)
@@ -1615,6 +1643,9 @@ class FakeDigitalApi:
         if path == "sites":
             return MockResponse(200, json_data={"sites": [
                 {"id": site_id, "name": {"text": name}} for site_id, name in self.sites.items()]})
+        if path == "films":
+            return MockResponse(200, json_data={"films": [
+                {"id": film_id, "title": {"text": title}} for film_id, title in self.listing]})
 
         site_ids = list((params or {}).get("siteIds") or [])
         if not site_ids:
@@ -1834,8 +1865,8 @@ class TestSessionSweep(unittest.TestCase):
             self.assertIn("SM Mall of Asia", sent["signals_found"][0])
             self.assertEqual([c["name"] for c in sent["cinemas"]], ["SM Mall of Asia"])
             with open(state_file, "r", encoding="utf-8") as f:
-                self.assertEqual(json.load(f), {"notify_phase": "open", "last_status": "available",
-                                                "film_id": "HO00001619", "alerted_sites": ["2022"]})
+                self.assertEqual(json.load(f), {"films": {"HO00001619": {
+                    "notify_phase": "open", "last_status": "available", "alerted_sites": ["2022"]}}})
 
 
 class TestEvaluateSessions(unittest.TestCase):
@@ -1922,6 +1953,12 @@ class TestCinemaLinks(unittest.TestCase):
         self.assertIn("SM-Megamall/2102) — sessions from Dec 16", value)
         self.assertIn("SM-City-Fairview/2007) — 1 session from Dec 16", value)
 
+    def test_book_now_links_the_listing_that_was_checked(self):
+        """With several listings watched, MOVIE_URL is not necessarily the film alerted on."""
+        url = "https://www.smcinema.com/films/Avengers-Doomsday-IMAX/HO00001701"
+        payload = checker.build_discord_payload({"signals_found": ["x"], "movie_url": url})
+        self.assertEqual(self.field(payload, "🔗 Book Now")["value"], "[Click here to book](%s)" % url)
+
     def test_announced_alert_has_no_cinema_links(self):
         """Booking has not opened yet, so there is nowhere to send anyone."""
         payload = checker.build_discord_payload(
@@ -1979,8 +2016,7 @@ class TestNewCinemaAlerts(unittest.TestCase):
             json.dump(state, f)
 
     def read(self):
-        with open(self.test_state_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return stored_film()
 
     @staticmethod
     def result(cinemas, sweep_error=None, starts_at=None, film_id="HO00001619"):
@@ -2064,8 +2100,7 @@ class TestNewCinemaAlerts(unittest.TestCase):
         gone = {"status": "UNAVAILABLE", "available": False, "signals_found": [],
                 "unavailable_signals": ["all sold out"], "film_id": "HO00001619"}
         self.run_check(gone)
-        self.assertEqual(self.read(), {"notify_phase": "none", "last_status": "unavailable",
-                                       "film_id": "HO00001619"})
+        self.assertEqual(self.read(), checker.DEFAULT_FILM_STATE)
 
     def test_switching_film_starts_a_fresh_record(self):
         self.write(film_id="HO00001625", alerted_sites=["2007"])
@@ -2077,7 +2112,7 @@ class TestNewCinemaAlerts(unittest.TestCase):
         self.write(notify_phase="announced")
         send = self.run_check(self.result([MEGAMALL], starts_at="2099-12-01T10:00:00+08:00"))
         send.assert_not_called()
-        self.assertNotIn("alerted_sites", self.read())
+        self.assertIsNone(self.read()["alerted_sites"])
 
     def test_hard_sweep_failure_still_alerts_then_fails_the_run(self):
         self.write(notify_phase="none", last_status="unavailable")
@@ -2097,6 +2132,192 @@ class TestNewCinemaAlerts(unittest.TestCase):
         soft = checker.error_result("sites returned HTTP 503", hard=False)
         self.run_check(self.result(None, sweep_error=soft)).assert_called_once()
         self.assertEqual(self.read()["notify_phase"], "open")
+
+
+# Two of the listings WATCH_TITLE="Doomsday" would pick up.
+INFINITY_VISION = {"id": "HO00001619", "url": checker.DEFAULT_MOVIE_URL,
+                   "title": "Avengers: Doomsday (Infinity Vision)"}
+IMAX = {"id": "HO00001701", "url": "https://www.smcinema.com/films/Avengers-Doomsday-IMAX/HO00001701",
+        "title": "Avengers: Doomsday (IMAX)"}
+
+
+class TestWatchedFilms(unittest.TestCase):
+    """
+    SM Cinema lists each format of a film as a film of its own (Avengers
+    Endgame: Encore has three), so a single MOVIE_URL only ever sees one of
+    them. WATCH_TITLE adds every listing whose title contains it.
+    """
+
+    LISTING = [
+        ("HO00001619", "Avengers: Doomsday (Infinity Vision)"),
+        ("HO00001701", "Avengers: Doomsday (IMAX)"),
+        ("HO00001700", "AVENGERS: DOOMSDAY"),
+        ("HO00001648", "Avengers Endgame: Encore (IMAX)"),
+    ]
+
+    def watched(self, api, title="Doomsday"):
+        with patch.object(checker, "WATCH_TITLE", title), \
+             patch.object(checker, "MOVIE_URL", checker.DEFAULT_MOVIE_URL):
+            return checker.watched_films(session=api)
+
+    def test_blank_watch_title_watches_movie_url_alone(self):
+        api = FakeDigitalApi(listing=self.LISTING)
+        films, error = self.watched(api, title="")
+        self.assertIsNone(error)
+        self.assertEqual([film["id"] for film in films], ["HO00001619"])
+        self.assertEqual(api.calls, [])
+
+    def test_every_matching_listing_is_watched_after_movie_urls_film(self):
+        films, error = self.watched(FakeDigitalApi(listing=self.LISTING))
+        self.assertIsNone(error)
+        self.assertEqual([(film["id"], film["title"], film["url"]) for film in films], [
+            ("HO00001619", "Avengers: Doomsday (Infinity Vision)", checker.DEFAULT_MOVIE_URL),
+            ("HO00001700", "AVENGERS: DOOMSDAY",
+             "https://www.smcinema.com/films/AVENGERS-DOOMSDAY/HO00001700"),
+            ("HO00001701", "Avengers: Doomsday (IMAX)",
+             "https://www.smcinema.com/films/Avengers-Doomsday-IMAX/HO00001701"),
+        ])
+
+    def test_an_unreadable_listing_falls_back_to_movie_urls_film(self):
+        for response, hard in ((MockResponse(503, "down"), False),
+                               (MockResponse(400, json_data={"detail": "bad"}), True)):
+            with self.subTest(status=response.status_code):
+                films, error = self.watched(
+                    FakeDigitalApi(listing=self.LISTING, fail={"films": response}))
+                self.assertEqual([film["id"] for film in films], ["HO00001619"])
+                self.assertEqual(error["hard"], hard)
+
+
+class TestWatchEveryListing(unittest.TestCase):
+    """main() checks every watched film, each with its own state and its own alerts."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.test_state_file = os.path.join(self.tmp_dir.name, "test_state.json")
+        self._original_state_file = checker.STATE_FILE
+        checker.STATE_FILE = self.test_state_file
+
+    def tearDown(self):
+        checker.STATE_FILE = self._original_state_file
+        self.tmp_dir.cleanup()
+
+    @staticmethod
+    def result(film, status="AVAILABLE", cinemas=()):
+        return {
+            "status": status, "available": status == "AVAILABLE",
+            "signals_found": ["x"], "unavailable_signals": [],
+            "page_title": "SM Cinema", "error_reason": None, "hard": False,
+            "startsAt": None, "starts_at": None,
+            "film_title": film["title"], "film_id": film["id"], "movie_url": film["url"],
+            "cinemas": list(cinemas), "sweep_error": None,
+        }
+
+    def patched(self, films, results, listing_error=None):
+        """results maps a film's URL to what checking it returns."""
+        return [
+            patch.object(checker, "WEBHOOK_URL", "https://discord.com/api/webhooks/x/y"),
+            patch.object(checker, "watched_films", return_value=(films, listing_error)),
+            patch.object(checker, "check_availability", side_effect=lambda url: results[url]),
+            patch.object(checker, "send_discord_notification", return_value=True),
+        ]
+
+    def run_main(self, films, results, listing_error=None):
+        patches = self.patched(films, results, listing_error)
+        for p in patches:
+            p.start()
+        try:
+            checker.main([])
+            return checker.send_discord_notification
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def test_each_listing_alerts_on_its_own(self):
+        send = self.run_main([INFINITY_VISION, IMAX], {
+            INFINITY_VISION["url"]: self.result(INFINITY_VISION, cinemas=[MEGAMALL]),
+            IMAX["url"]: self.result(IMAX, cinemas=[FAIRVIEW]),
+        })
+        sent = [call.args[0] for call in send.call_args_list]
+        self.assertEqual([r["film_title"] for r in sent],
+                         ["Avengers: Doomsday (Infinity Vision)", "Avengers: Doomsday (IMAX)"])
+        book_now = [next(f["value"] for f in checker.build_discord_payload(r)["embeds"][0]["fields"]
+                         if f["name"] == "🔗 Book Now") for r in sent]
+        self.assertEqual(book_now, ["[Click here to book](%s)" % INFINITY_VISION["url"],
+                                    "[Click here to book](%s)" % IMAX["url"]])
+        self.assertEqual(stored_film("HO00001619")["alerted_sites"], ["2102"])
+        self.assertEqual(stored_film("HO00001701")["alerted_sites"], ["2007"])
+
+    def test_a_new_listing_alerts_while_the_first_stays_quiet(self):
+        checker.save_state({"HO00001619": {"notify_phase": "open", "last_status": "available",
+                                           "alerted_sites": ["2102"]}})
+        send = self.run_main([INFINITY_VISION, IMAX], {
+            INFINITY_VISION["url"]: self.result(INFINITY_VISION, cinemas=[MEGAMALL]),
+            IMAX["url"]: self.result(IMAX, cinemas=[FAIRVIEW]),
+        })
+        send.assert_called_once()
+        self.assertEqual(send.call_args.args[0]["film_id"], "HO00001701")
+
+    def test_todays_single_film_state_carries_over(self):
+        """The live state.json predates multi-film watching; its film keeps what it announced."""
+        with open(self.test_state_file, "w", encoding="utf-8") as f:
+            json.dump({"notify_phase": "open", "last_status": "available", "film_id": "HO00001619",
+                       "alerted_sites": ["2007", "2022", "2102"]}, f)
+        send = self.run_main([INFINITY_VISION, IMAX], {
+            INFINITY_VISION["url"]: self.result(INFINITY_VISION, cinemas=[FAIRVIEW, MOA, MEGAMALL]),
+            IMAX["url"]: self.result(IMAX, status="UNAVAILABLE"),
+        })
+        send.assert_not_called()
+        self.assertEqual(stored_film("HO00001619")["alerted_sites"], ["2007", "2022", "2102"])
+
+    def test_one_listings_hard_failure_does_not_stop_the_others(self):
+        results = {
+            INFINITY_VISION["url"]: checker.error_result("API film not found (HTTP 404)", hard=True),
+            IMAX["url"]: self.result(IMAX, cinemas=[FAIRVIEW]),
+        }
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main([INFINITY_VISION, IMAX], results)
+        self.assertEqual(ctx.exception.code, 1)
+        # IMAX was still checked, alerted and saved before the run went red.
+        self.assertEqual(stored_film("HO00001701")["notify_phase"], "open")
+
+    def test_a_hard_listing_failure_still_checks_movie_urls_film(self):
+        hard = checker.error_result("films returned HTTP 400", hard=True)
+        with self.assertRaises(SystemExit) as ctx:
+            self.run_main([INFINITY_VISION], {
+                INFINITY_VISION["url"]: self.result(INFINITY_VISION, cinemas=[MEGAMALL])},
+                listing_error=hard)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(stored_film("HO00001619")["notify_phase"], "open")
+
+    def test_a_listing_that_failed_to_load_keeps_its_state(self):
+        """Forgetting it on a partial watch list would re-alert it once the listing loads again."""
+        checker.save_state({"HO00001701": {"notify_phase": "open", "last_status": "available",
+                                           "alerted_sites": ["2007"]}})
+        soft = checker.error_result("films returned HTTP 503", hard=False)
+        self.run_main([INFINITY_VISION], {
+            INFINITY_VISION["url"]: self.result(INFINITY_VISION, status="UNAVAILABLE")},
+            listing_error=soft)
+        self.assertEqual(stored_film("HO00001701")["notify_phase"], "open")
+
+    def test_a_run_watching_fewer_films_keeps_the_others_state(self):
+        """
+        check-browser.yml runs without WATCH_TITLE and commits state.json too.
+        Dropping the films it did not check would make the scheduled checker
+        re-announce every one of their cinemas.
+        """
+        checker.save_state({"HO00001701": {"notify_phase": "open", "last_status": "available",
+                                           "alerted_sites": ["2007"]}})
+        self.run_main([INFINITY_VISION], {
+            INFINITY_VISION["url"]: self.result(INFINITY_VISION, status="UNAVAILABLE")})
+        self.assertEqual(stored_film("HO00001701")["alerted_sites"], ["2007"])
+
+    def test_the_run_waits_once_however_many_films_it_checks(self):
+        with patch.object(checker, "initial_jitter") as jitter:
+            self.run_main([INFINITY_VISION, IMAX], {
+                INFINITY_VISION["url"]: self.result(INFINITY_VISION, status="UNAVAILABLE"),
+                IMAX["url"]: self.result(IMAX, status="UNAVAILABLE"),
+            })
+        jitter.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -67,6 +67,11 @@ DEFAULT_POSTER_URL = (
 # secret expands to an empty string — so the documented default would never
 # apply on Actions. Treat blank as unset.
 MOVIE_URL = (os.environ.get("MOVIE_URL") or "").strip() or DEFAULT_MOVIE_URL
+# Also watch every listing whose title contains this, e.g. "Doomsday". SM Cinema
+# lists each format of a film (Infinity Vision, IMAX, ...) as a film of its own,
+# with its own sessions, so MOVIE_URL alone only ever sees one of them.
+# Blank watches MOVIE_URL's film alone.
+WATCH_TITLE = (os.environ.get("WATCH_TITLE") or "").strip()
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 MENTION = os.environ.get("MENTION", "")  # e.g. "@everyone" or "<@&ROLE_ID>"
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Manila")
@@ -275,68 +280,91 @@ def evaluate_signals(film_status, content_buttons, session_elements, cleaned_tex
 
 # ── State Management ───────────────────────────────────────────────────────────
 
+# A film nothing has happened to yet. Films in this state are left out of
+# state.json entirely.
+DEFAULT_FILM_STATE = {"notify_phase": "none", "last_status": "unavailable", "alerted_sites": None}
+
+
+def _film_state(data):
+    """One film's notification state, normalised from whatever was stored."""
+    data = data if isinstance(data, dict) else {}
+
+    # Migration from legacy boolean 'notified'
+    if "notify_phase" in data:
+        notify_phase = data["notify_phase"]
+    elif "notified" in data:
+        notify_phase = "open" if data["notified"] else "none"
+    else:
+        notify_phase = "none"
+    if notify_phase not in ("none", "announced", "open"):
+        notify_phase = "none"
+
+    # Cinemas already announced for the current phase. None means no record
+    # yet: absent on state written before cinema tracking.
+    alerted_sites = data.get("alerted_sites")
+    if not isinstance(alerted_sites, list) or not all(
+        isinstance(site_id, str) for site_id in alerted_sites
+    ):
+        alerted_sites = None
+
+    return {
+        "notify_phase": notify_phase,
+        "last_status": data.get("last_status", "unavailable"),
+        "alerted_sites": alerted_sites,
+    }
+
+
 def load_state():
-    """Load the state file that tracks the notification phase and last status."""
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                last_status = data.get("last_status", "unavailable")
+    """
+    Load each film's notification state, keyed by film ID.
 
-                # Migration from legacy boolean 'notified'
-                if "notify_phase" in data:
-                    notify_phase = data["notify_phase"]
-                elif "notified" in data:
-                    notify_phase = "open" if data["notified"] else "none"
-                else:
-                    notify_phase = "none"
-
-                if notify_phase not in ("none", "announced", "open"):
-                    notify_phase = "none"
-
-                # Absent on state files written before film tracking existed.
-                film_id = data.get("film_id")
-                if not isinstance(film_id, str) or not film_id.strip():
-                    film_id = None
-
-                # Cinemas already announced for the current phase. None means
-                # unknown: absent on state files written before cinema tracking.
-                alerted_sites = data.get("alerted_sites")
-                if not isinstance(alerted_sites, list) or not all(
-                    isinstance(site_id, str) for site_id in alerted_sites
-                ):
-                    alerted_sites = None
-
-                return {
-                    "notify_phase": notify_phase,
-                    "last_status": last_status,
-                    "film_id": film_id,
-                    "alerted_sites": alerted_sites,
-                }
-        except Exception as e:
-            print(f"[STATE] Error loading {STATE_FILE}: {e}. Initializing fresh state.")
-    return {"notify_phase": "none", "last_status": "unavailable", "film_id": None, "alerted_sites": None}
-
-
-def save_state(state):
-    """Save the state back to disk."""
+    state.json holds {"films": {film_id: state}}, one entry per film, so a
+    phase can only ever describe the film it was recorded for. Files from
+    before more than one film was watched hold a single film's state at the
+    top level: that belongs to its recorded film_id, or to MOVIE_URL's film
+    when the file predates film tracking as well.
+    """
+    if not os.path.exists(STATE_FILE):
+        return {}
     try:
-        payload = {
-            "notify_phase": state.get("notify_phase", "none"),
-            "last_status": state.get("last_status", "unavailable"),
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[STATE] Error loading {STATE_FILE}: {e}. Initializing fresh state.")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    if isinstance(data.get("films"), dict):
+        films = {
+            str(film_id).strip().upper(): _film_state(state)
+            for film_id, state in data["films"].items()
+            if str(film_id).strip()
         }
-        # Records WHICH film the phase above refers to, so repointing MOVIE_URL
-        # at another film cannot inherit its predecessor's "already notified".
-        film_id = state.get("film_id")
-        if isinstance(film_id, str) and film_id.strip():
-            payload["film_id"] = film_id.strip()
-        # Which cinemas an alert has already named, so a cinema that starts
-        # selling later gets an alert of its own. Omitted while unknown.
-        alerted_sites = state.get("alerted_sites")
-        if isinstance(alerted_sites, list):
-            payload["alerted_sites"] = sorted(alerted_sites)
+    else:
+        film_id = data.get("film_id")
+        if not isinstance(film_id, str) or not film_id.strip():
+            film_id = extract_film_id(MOVIE_URL)
+        films = {film_id.strip().upper(): _film_state(data)}
+    return {film_id: state for film_id, state in films.items() if state != DEFAULT_FILM_STATE}
+
+
+def save_state(films):
+    """Save each film's notification state, leaving out films with nothing recorded."""
+    try:
+        payload = {}
+        for film_id in sorted(films):
+            state = _film_state(films[film_id])
+            if state == DEFAULT_FILM_STATE:
+                continue
+            entry = {"notify_phase": state["notify_phase"], "last_status": state["last_status"]}
+            # Which cinemas an alert has already named, so a cinema that starts
+            # selling later gets an alert of its own. Omitted while unknown.
+            if state["alerted_sites"] is not None:
+                entry["alerted_sites"] = sorted(state["alerted_sites"])
+            payload[film_id] = entry
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+            json.dump({"films": payload}, f, indent=2)
             f.write("\n")
     except Exception as e:
         print(f"[STATE] Error saving {STATE_FILE}: {e}")
@@ -365,7 +393,7 @@ def determine_booking_phase(result):
 
 # ── Browser-based Scraping (Fallback) ──────────────────────────────────────────
 
-def check_availability_browser():
+def check_availability_browser(movie_url=None):
     """
     Launch headless Chromium, load the SM Cinema page, wait for JavaScript rendering,
     and inspect the page for ticket availability signals.
@@ -377,7 +405,8 @@ def check_availability_browser():
 
     Returns dict with status, availability bool, signals found, and error reason.
     """
-    print(f"[CHECK] Loading page: {MOVIE_URL}")
+    movie_url = movie_url or MOVIE_URL
+    print(f"[CHECK] Loading page: {movie_url}")
 
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -425,7 +454,7 @@ def check_availability_browser():
 
         try:
             try:
-                response = page.goto(MOVIE_URL, wait_until="domcontentloaded", timeout=35000)
+                response = page.goto(movie_url, wait_until="domcontentloaded", timeout=35000)
             except PlaywrightTimeout:
                 print("[ERROR] Page navigation timed out.")
                 return error_result("Navigation timeout", page_title="Timeout", hard=False)
@@ -530,6 +559,7 @@ def check_availability_browser():
                 "hard": (status == "ERROR"),
                 "startsAt": None,
                 "starts_at": None,
+                "movie_url": movie_url,
             }
 
         except PlaywrightTimeout:
@@ -1322,10 +1352,17 @@ def _check_availability_api_single(movie_url, session=None):
         "starts_at": earliest_starts_at,
         "film_title": film_title,
         "film_id": film_id,
+        "movie_url": movie_url,
         # Where to book right now; None when the sweep could not run.
         "cinemas": cinemas,
         "sweep_error": sweep_error,
     }
+
+
+def film_url(film_id, title):
+    """A film's page, e.g. https://www.smcinema.com/films/Avengers-Doomsday/HO00001619."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", title or "").strip("-") or film_id
+    return f"https://www.smcinema.com/films/{slug}/{film_id}"
 
 
 def list_films(session=None):
@@ -1398,24 +1435,83 @@ def list_films(session=None):
         print(f"  {film_id}  {title}")
     if rows:
         example_id, example_title = rows[0]
-        slug = re.sub(r"[^A-Za-z0-9]+", "-", example_title).strip("-")
         print(f"\nSet MOVIE_URL to the film page URL ending in the ID, e.g.")
-        print(f"  https://www.smcinema.com/films/{slug}/{example_id}")
+        print(f"  {film_url(example_id, example_title)}")
     return rows
 
 
-def check_availability_api(retry_backoffs=None):
+def watched_films(session=None):
     """
-    Check ticket availability directly via SM Cinema's internal JSON API.
-    Retries up to 3 times on soft failures with growing backoff (roughly 0s, 30s, 90s).
+    The films to check this run: MOVIE_URL's, then every listing whose title
+    contains WATCH_TITLE, alphabetically.
+
+    Returns (films, error). films is [{"id", "url", "title"}] with MOVIE_URL's
+    film first. error is None, or the error_result of a listing that could not
+    be read, in which case films holds MOVIE_URL's film alone.
     """
-    # Small random jitter (0-60s) on GitHub Actions to desynchronize cron runs
+    primary_id = extract_film_id(MOVIE_URL).strip().upper()
+    films = [{"id": primary_id, "url": MOVIE_URL, "title": None}]
+    if not WATCH_TITLE:
+        return films, None
+
+    if session is None:
+        if requests is None:
+            return films, error_result("'requests' library not installed", page_title="Missing Dependency", hard=True)
+        session = requests.Session()
+
+    try:
+        resp = session.get(
+            MOVIE_URL,
+            headers={
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=15,
+        )
+        gas_token = extract_gas_token(resp.text) if resp.status_code == 200 else None
+    except Exception:
+        gas_token = None
+    if not gas_token:
+        # MOVIE_URL's own check fetches the same page, and classifies why it
+        # failed properly; this stays soft so it does not fail the run twice.
+        return films, error_result("film listing: could not read a gasToken", page_title="Listing Error", hard=False)
+
+    listing, err = _ocapi_list(session, gas_token, "films", "films")
+    if err:
+        return films, err
+
+    matches = []
+    for film in listing:
+        if not isinstance(film, dict):
+            continue
+        film_id = str(film.get("id") or "").strip().upper()
+        title = film.get("title")
+        title = title.get("text") if isinstance(title, dict) else title
+        if not film_id or not isinstance(title, str) or WATCH_TITLE.lower() not in title.lower():
+            continue
+        if film_id == primary_id:
+            films[0]["title"] = title
+        else:
+            matches.append({"id": film_id, "url": film_url(film_id, title), "title": title})
+    return films + sorted(matches, key=lambda film: film["title"].lower()), None
+
+
+def initial_jitter():
+    """Small random delay (0-60s) on GitHub Actions to desynchronize cron runs. Once per run."""
     max_jitter = int(os.environ.get("INITIAL_DELAY_MAX", "60" if os.environ.get("GITHUB_ACTIONS") else "0"))
     if max_jitter > 0 and not os.environ.get("SKIP_INITIAL_DELAY"):
         jitter = random.uniform(0, max_jitter)
         print(f"[CHECK] Initial random jitter: sleeping {jitter:.1f}s...")
         time.sleep(jitter)
 
+
+def check_availability_api(movie_url=None, retry_backoffs=None):
+    """
+    Check ticket availability directly via SM Cinema's internal JSON API.
+    Retries up to 3 times on soft failures with growing backoff (roughly 0s, 30s, 90s).
+    """
+    movie_url = movie_url or MOVIE_URL
     if retry_backoffs is None:
         retry_backoffs = (0, 30, 90)
 
@@ -1429,7 +1525,7 @@ def check_availability_api(retry_backoffs=None):
         else:
             print(f"[CHECK] Checking availability via API (attempt {attempt}/{len(retry_backoffs)})...")
 
-        result = _check_availability_api_single(MOVIE_URL, session=session)
+        result = _check_availability_api_single(movie_url, session=session)
 
         if result["status"] != "ERROR":
             return result
@@ -1442,16 +1538,17 @@ def check_availability_api(retry_backoffs=None):
     return last_result
 
 
-def check_availability():
+def check_availability(movie_url=None):
     """
-    Main entry point for checking ticket availability.
-    Defaults to lightweight JSON API check.
+    Main entry point for checking one film's ticket availability (MOVIE_URL's
+    by default). Defaults to lightweight JSON API check.
     Set USE_BROWSER_FALLBACK=1 to use headless Playwright browser check.
     """
+    movie_url = movie_url or MOVIE_URL
     if os.environ.get("USE_BROWSER_FALLBACK", "").lower() in ("1", "true", "yes"):
         print("[CHECK] Mode: Browser fallback (Playwright)")
-        return check_availability_browser()
-    return check_availability_api()
+        return check_availability_browser(movie_url)
+    return check_availability_api(movie_url)
 
 
 # ── Discord Notification ───────────────────────────────────────────────────────
@@ -1589,7 +1686,7 @@ def build_discord_payload(result, is_test=False, new_cinemas=None):
         },
         {
             "name": "🔗 Book Now",
-            "value": f"[Click here to book]({MOVIE_URL})",
+            "value": f"[Click here to book]({result.get('movie_url') or MOVIE_URL})",
             "inline": False,
         },
     ]
@@ -1700,6 +1797,7 @@ def build_simulated_result(phase, film_title=None, now=None):
         "starts_at": starts_at_iso,
         "film_title": film_title,
         "film_id": extract_film_id(MOVIE_URL),
+        "movie_url": MOVIE_URL,
         "cinemas": [dict(SIMULATED_CINEMA)],
         "sweep_error": None,
     }
@@ -1909,6 +2007,107 @@ def simulate_alert(phases, session=None):
 
 # ── Main Entry Point ───────────────────────────────────────────────────────────
 
+def process_check(result, film_state):
+    """
+    Apply one film's check result to that film's notification state, sending
+    whatever alert is now due.
+
+    Returns (new_state, hard_failure). film_state is left untouched. A hard
+    failure means the run must end red, once every film has been handled.
+    """
+    state = dict(film_state)
+    status = result["status"]
+
+    # 1. Handle scrape / network / Cloudflare errors or detection drift
+    if status == "ERROR":
+        print(f"\n[ACTION] Scrape resulted in ERROR ({result.get('error_reason')}).")
+        print("[ACTION] Preserving existing notification state. No state changes saved.")
+        if result.get("hard"):
+            print("[ACTION] Hard failure — this run will exit non-zero so it shows as failed.")
+            return state, True
+        print("[ACTION] Transient failure — this run stays green.")
+        return state, False
+
+    # 2. Genuine page reading obtained
+    previous_status = film_state["last_status"]
+
+    if status == "AVAILABLE":
+        state["last_status"] = "available"
+        stored_phase = film_state["notify_phase"]
+        current_phase = determine_booking_phase(result)
+        # Where to book right now. None means the sweep could not run, which is
+        # "unknown", not "nowhere", so cinema tracking then leaves state alone.
+        cinemas = result.get("cinemas")
+        alerted = film_state["alerted_sites"]
+
+        should_notify = (
+            (stored_phase == "none" and current_phase in ("announced", "open"))
+            or (stored_phase == "announced" and current_phase == "open")
+        )
+
+        if should_notify:
+            starts_at = result.get("startsAt") or result.get("starts_at")
+            if current_phase == "announced":
+                dt = parse_iso_datetime(starts_at)
+                fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)") if dt else starts_at
+                print(f"\n[ACTION] 🎉 Advance booking announced (opens at {fmt})! Sending notification...")
+            else:
+                if starts_at:
+                    dt = parse_iso_datetime(starts_at)
+                    fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)") if dt else starts_at
+                    print(f"\n[ACTION] 🎉 Tickets confirmed open now (started {fmt})! Sending notification...")
+                else:
+                    print("\n[ACTION] 🎉 Tickets confirmed available (open now)! Sending notification...")
+            notified = send_discord_notification(result)
+            # Only advance the phase once the alert has actually landed. Advancing
+            # it when no webhook is configured would commit "already notified" back
+            # to the repo and permanently suppress the alert — including after the
+            # webhook is later fixed. A failed send must stay retryable.
+            if notified:
+                state["notify_phase"] = current_phase
+                # That alert just named every cinema selling right now.
+                if current_phase == "open" and cinemas is not None:
+                    state["alerted_sites"] = sorted(set(alerted or []) | {c["id"] for c in cinemas})
+        elif current_phase == "open" and cinemas is not None:
+            # No record yet counts as nothing announced. Assuming the earlier
+            # alert covered every cinema selling now would silently swallow any
+            # that started selling since: SM Mall of Asia did exactly that the
+            # day this tracking was written. A repeat beats a missed cinema.
+            #
+            # Only on a known count of sessions with seats: an unknown count
+            # means no seat data came back at all, which is no proof of a sale.
+            new_cinemas = [c for c in cinemas if c["id"] not in (alerted or []) and c.get("sessions")]
+            if new_cinemas:
+                names = ", ".join(c["name"] for c in new_cinemas)
+                print(f"\n[ACTION] 🎉 Now also booking at {names}! Sending notification...")
+                # Same rule as the phase: record a cinema only once its alert
+                # has landed, so a failed send stays retryable.
+                if send_discord_notification(result, new_cinemas=new_cinemas):
+                    state["alerted_sites"] = sorted(set(alerted or []) | {c["id"] for c in new_cinemas})
+            else:
+                print("\n[ACTION] Tickets available (open), and every cinema selling has been announced. Skipping.")
+        else:
+            print(f"\n[ACTION] Tickets available ({current_phase}), but notification already sent ({stored_phase}). Skipping.")
+    else:  # UNAVAILABLE
+        state["last_status"] = "unavailable"
+        print("\n[ACTION] Confirmed: No tickets available yet.")
+        # Only reset notify_phase if tickets were PREVIOUSLY confirmed available and have now disappeared
+        if film_state["notify_phase"] != "none" and previous_status == "available":
+            state["notify_phase"] = "none"
+            state["alerted_sites"] = None
+            print("[STATE] Reset notify_phase: Tickets were previously available but are now confirmed unavailable.")
+
+    # The categories carried this check, but a sweep broken for good means a
+    # cinema that starts selling can no longer be noticed: fail the run like
+    # any other hard failure.
+    sweep_error = result.get("sweep_error")
+    if sweep_error and sweep_error.get("hard"):
+        print(f"[ACTION] Session sweep failed hard ({sweep_error.get('error_reason')}) — "
+              "this run will exit non-zero so it shows as failed.")
+        return state, True
+    return state, False
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="SM Cinema Ticket Availability Checker")
     parser.add_argument(
@@ -1970,135 +2169,53 @@ def main(argv=None):
         print(f"\n{'='*60}\n")
         return
 
-    state = load_state()
-    old_state = dict(state)
+    initial_jitter()
 
-    print(f"[STATE] Current status: {state.get('last_status')}")
-    print(f"[STATE] Notification phase: {state.get('notify_phase')}")
-
-    result = check_availability()
-    status = result["status"]
-
-    # 1. Handle scrape / network / Cloudflare errors or detection drift
-    if status == "ERROR":
-        print(f"\n[ACTION] Scrape resulted in ERROR ({result.get('error_reason')}).")
-        print("[ACTION] Preserving existing notification state. No state changes saved.")
-        if result.get("hard"):
-            # Blocked, misconfigured, or no longer able to read the page: fail the
-            # run so Actions shows red and GitHub emails, instead of a green tick
-            # that is indistinguishable from "no tickets yet".
-            print("[ACTION] Hard failure — exiting non-zero so this run shows as failed.")
-            print("\n" + "=" * 60 + "\n")
-            sys.exit(1)
-        print("[ACTION] Transient failure — this run stays green.")
-        print(f"\n{'='*60}\n")
-        return
-
-    # 2. Genuine page reading obtained
-    previous_status = old_state.get("last_status", "unavailable")
-
-    # A phase describes one film. If MOVIE_URL now points somewhere else, the
-    # stored phase belongs to the previous film — carrying it over would mark
-    # the new film as "already notified" and silently swallow its alert.
-    current_film_id = result.get("film_id") or extract_film_id(MOVIE_URL)
-    previous_film_id = old_state.get("film_id")
-    if current_film_id:
-        state["film_id"] = current_film_id
-        if previous_film_id and previous_film_id != current_film_id:
-            print(f"[STATE] Film changed ({previous_film_id} -> {current_film_id}). "
-                  f"Resetting notification phase for the new film.")
-            old_state = dict(old_state)
-            old_state["notify_phase"] = "none"
-            old_state["alerted_sites"] = None
-            state["notify_phase"] = "none"
-            state["alerted_sites"] = None
-            previous_status = "unavailable"
-
-    if status == "AVAILABLE":
-        state["last_status"] = "available"
-        stored_phase = old_state.get("notify_phase", "none")
-        current_phase = determine_booking_phase(result)
-        # Where to book right now. None means the sweep could not run, which is
-        # "unknown", not "nowhere", so cinema tracking then leaves state alone.
-        cinemas = result.get("cinemas")
-        alerted = old_state.get("alerted_sites")
-
-        should_notify = (
-            (stored_phase == "none" and current_phase in ("announced", "open"))
-            or (stored_phase == "announced" and current_phase == "open")
-        )
-
-        if should_notify:
-            starts_at = result.get("startsAt") or result.get("starts_at")
-            if current_phase == "announced":
-                dt = parse_iso_datetime(starts_at)
-                fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)") if dt else starts_at
-                print(f"\n[ACTION] 🎉 Advance booking announced (opens at {fmt})! Sending notification...")
-            else:
-                if starts_at:
-                    dt = parse_iso_datetime(starts_at)
-                    fmt = dt.strftime("%B %d, %Y at %I:%M %p (PHT)") if dt else starts_at
-                    print(f"\n[ACTION] 🎉 Tickets confirmed open now (started {fmt})! Sending notification...")
-                else:
-                    print("\n[ACTION] 🎉 Tickets confirmed available (open now)! Sending notification...")
-            notified = send_discord_notification(result)
-            # Only advance the phase once the alert has actually landed. Advancing
-            # it when no webhook is configured would commit "already notified" back
-            # to the repo and permanently suppress the alert — including after the
-            # webhook is later fixed. A failed send must stay retryable.
-            if notified:
-                state["notify_phase"] = current_phase
-                # That alert just named every cinema selling right now.
-                if current_phase == "open" and cinemas is not None:
-                    state["alerted_sites"] = sorted(set(alerted or []) | {c["id"] for c in cinemas})
-        elif current_phase == "open" and cinemas is not None:
-            # No record yet counts as nothing announced. Assuming the earlier
-            # alert covered every cinema selling now would silently swallow any
-            # that started selling since: SM Mall of Asia did exactly that the
-            # day this tracking was written. A repeat beats a missed cinema.
-            #
-            # Only on a known count of sessions with seats: an unknown count
-            # means no seat data came back at all, which is no proof of a sale.
-            new_cinemas = [c for c in cinemas if c["id"] not in (alerted or []) and c.get("sessions")]
-            if new_cinemas:
-                names = ", ".join(c["name"] for c in new_cinemas)
-                print(f"\n[ACTION] 🎉 Now also booking at {names}! Sending notification...")
-                # Same rule as the phase: record a cinema only once its alert
-                # has landed, so a failed send stays retryable.
-                if send_discord_notification(result, new_cinemas=new_cinemas):
-                    state["alerted_sites"] = sorted(set(alerted or []) | {c["id"] for c in new_cinemas})
-            else:
-                print("\n[ACTION] Tickets available (open), and every cinema selling has been announced. Skipping.")
+    films, listing_error = watched_films()
+    if WATCH_TITLE:
+        if listing_error:
+            print(f"[WATCH] Could not list films matching '{WATCH_TITLE}' "
+                  f"({listing_error.get('error_reason')}); checking MOVIE_URL's film only.")
         else:
-            print(f"\n[ACTION] Tickets available ({current_phase}), but notification already sent ({stored_phase}). Skipping.")
-    else:  # UNAVAILABLE
-        state["last_status"] = "unavailable"
-        print("\n[ACTION] Confirmed: No tickets available yet.")
-        # Only reset notify_phase if tickets were PREVIOUSLY confirmed available and have now disappeared
-        if old_state.get("notify_phase") != "none" and previous_status == "available":
-            state["notify_phase"] = "none"
-            state["alerted_sites"] = None
-            print("[STATE] Reset notify_phase: Tickets were previously available but are now confirmed unavailable.")
+            print(f"[WATCH] Checking {len(films)} film(s): MOVIE_URL's, plus every "
+                  f"listing with '{WATCH_TITLE}' in its title.")
+
+    states = load_state()
+    new_states = dict(states)
+    hard_failure = bool(listing_error and listing_error.get("hard"))
+
+    for film in films:
+        print(f"\n{'-'*60}")
+        print(f"[FILM] {film['title'] or film['url']} ({film['id']})")
+        film_state = states.get(film["id"], dict(DEFAULT_FILM_STATE))
+        print(f"[STATE] Current status: {film_state['last_status']}")
+        print(f"[STATE] Notification phase: {film_state['notify_phase']}")
+
+        result = check_availability(film["url"])
+        new_state, failed = process_check(result, film_state)
+        new_states[film["id"]] = new_state
+        hard_failure = hard_failure or failed
+
+    print(f"\n{'-'*60}")
+    # A film this run did not check keeps its state, however it came to be
+    # unchecked: a listing that failed to load, or a run watching fewer films
+    # (check-browser.yml runs without WATCH_TITLE and commits state.json too).
+    # Dropping it would re-announce every one of its cinemas next time.
+    new_states = {film_id: s for film_id, s in new_states.items() if s != DEFAULT_FILM_STATE}
 
     # 3. Only persist state to disk if state actually changed
-    if (
-        state.get("notify_phase") != old_state.get("notify_phase")
-        or state.get("last_status") != old_state.get("last_status")
-        or state.get("film_id") != old_state.get("film_id")
-        or state.get("alerted_sites") != old_state.get("alerted_sites")
-    ):
-        save_state(state)
-        print(f"\n[STATE] Meaningful state change detected. Saved to {STATE_FILE}: {state}")
+    if new_states != states:
+        save_state(new_states)
+        print(f"[STATE] Meaningful state change detected. Saved to {STATE_FILE}: {new_states}")
     else:
-        print(f"\n[STATE] No state change ({state.get('last_status')}, notify_phase={state.get('notify_phase')}). Zero file modifications.")
+        print("[STATE] No state change. Zero file modifications.")
 
-    # The categories carried this run, but a sweep broken for good means a
-    # cinema that starts selling can no longer be noticed. Now that state is
-    # saved, fail the run like any other hard failure.
-    sweep_error = result.get("sweep_error")
-    if sweep_error and sweep_error.get("hard"):
-        print(f"[ACTION] Session sweep failed hard ({sweep_error.get('error_reason')}) — "
-              "exiting non-zero so this run shows as failed.")
+    if hard_failure:
+        # Blocked, misconfigured, or no longer able to read the page: fail the
+        # run so Actions shows red and GitHub emails, instead of a green tick
+        # that is indistinguishable from "no tickets yet". Only now, so every
+        # other film was still checked and its state saved.
+        print("[ACTION] Hard failure above — exiting non-zero so this run shows as failed.")
         print(f"\n{'='*60}\n")
         sys.exit(1)
 

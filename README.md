@@ -10,6 +10,7 @@ An automated ticket availability monitor for **Avengers: Doomsday** at **SM Cine
 - **Direct JSON API First:** Directly queries SM Cinema's internal backend (`digital-api.smcinema.com/ocapi/v1/films/<ID>/availability`) using the JWT `gasToken` extracted from the page's Next.js SSR hydration data (`__NEXT_DATA__`). Completes in a few seconds with minimal bandwidth and zero browser footprint.
 - **Session Sweep:** Every check looks for real sessions at every cinema — SM Cinema can put tickets on sale without changing the category. See [Why categories are not enough](#why-categories-are-not-enough).
 - **Cinema Links & New-Cinema Alerts:** Alerts link each cinema you can book at. A cinema that starts selling after the first alert gets an alert of its own, naming just that cinema.
+- **Every Listing of the Film:** SM Cinema lists each format (IMAX, Infinity Vision, ...) as a separate film. `WATCH_TITLE` makes the bot watch every listing with that in its title, each with its own alerts — see [Watching every listing](#watching-every-listing-of-a-film).
 - **Opt-In Browser Fallback:** Retains the full Playwright headless browser implementation (with bot-evasion masks) via `USE_BROWSER_FALLBACK=1` and a manual `check-browser.yml` workflow.
 - **Robust Error Classification:** Soft errors (network timeouts, Cloudflare 403/429 rate limits, 5xx server errors) are automatically retried with exponential backoff. Hard errors (404 Not Found, auth rejection, schema drift) fail loudly to trigger GitHub alert notifications.
 - **Scoped Signal Matching & Interim Decision Rules:** Evaluates film availability categories, advance booking periods, and showtimes with conservative defaults biased toward alerting.
@@ -252,6 +253,26 @@ Every run also prints the resolved title of the film it actually checked:
 If that `Movie:` line is not the film you expected, `MOVIE_URL` is not reaching the
 script — check the secret name, or that your shell actually exported it.
 
+### Watching every listing of a film
+
+SM Cinema lists each format of a film as a film of its own, with its own ID and its
+own sessions — *Avengers Endgame: Encore* is three: standard, IMAX and Infinity
+Vision. `MOVIE_URL` alone only ever sees one of them.
+
+`WATCH_TITLE` adds every listing whose title contains it (case-insensitive), checked
+alongside `MOVIE_URL`'s film. `check.yml` sets `WATCH_TITLE: Doomsday`, so a standard
+or IMAX *Avengers: Doomsday* listing is picked up the first time it appears, with
+alerts of its own. Every run logs what it checked:
+
+```
+[WATCH] Checking 1 film(s): MOVIE_URL's, plus every listing with 'Doomsday' in its title.
+[FILM] Avengers: Doomsday (Infinity Vision) (HO00001619)
+```
+
+Leave `WATCH_TITLE` blank to watch `MOVIE_URL`'s film alone — the default, and what
+the manual workflows use. If the film list cannot be read, that run checks
+`MOVIE_URL`'s film alone and keeps every other listing's state as it was.
+
 ---
 
 ## 💻 Local Development & Testing
@@ -350,24 +371,29 @@ built the same way as the site's own links.
 
 ### Switching Which Film Is Watched
 
-`state.json` records the `film_id` its phase belongs to. Repoint `MOVIE_URL` at a
-different film and the phase resets automatically on the next run:
+`state.json` keeps each film's state under its own film ID:
 
+```json
+{"films": {"HO00001619": {"notify_phase": "open", "last_status": "available", "alerted_sites": ["2007", "2022", "2102"]}}}
 ```
-[STATE] Film changed (HO00001625 -> HO00001619). Resetting notification phase for the new film.
-```
 
-Without this, switching to a film whose tickets are *already* on sale would inherit the
-previous film's `"open"` phase and silently swallow the alert. `film_id` is added to
-`state.json` on the first run after upgrading; state files written before it still load.
+A phase can therefore only ever describe the film it was recorded for: repoint
+`MOVIE_URL` at a different film and that film starts from `none`. Without this,
+switching to a film whose tickets are *already* on sale would inherit the previous
+film's `"open"` phase and silently swallow the alert. A film keeps its state even in
+runs that do not check it — `check-browser.yml` watches `MOVIE_URL`'s film alone and
+commits `state.json` too, and dropping the others there would make the scheduled
+checker re-announce all their cinemas. Films with nothing recorded yet are left out.
+Older single-film state files still load, and are rewritten in this shape the next
+time something changes.
 
-### Multi-Phase Notification Tracking (`state.json`)
+### Multi-Phase Notification Tracking (`state.json`, per film)
 - `none` → `announced`: Advance booking schedule announced (`startsAt` in the future) → sends "Advance booking announced" alert.
 - `announced` → `open`: Advance booking time has arrived (`startsAt` in past/now) → sends "Tickets open now!" alert.
 - `none` → `open`: Tickets released straight to sale without advance announcement → sends "Tickets open now!" alert.
 - `announced` → `announced` or `open` → `open`: No repeated alerts for the same phase.
 - While `open`: a cinema that starts selling gets a "Now booking at more cinemas" alert naming just the new cinemas. `alerted_sites` records every cinema announced so far, so each is announced once — even if it sells out and reopens.
-- `ERROR` never resets the notification phase and never writes state, so a temporary network failure cannot cause duplicate alerts.
+- `ERROR` never touches that film's state, so a temporary network failure cannot cause duplicate alerts. The other watched films are still checked, and a hard failure fails the run only after all of them are done and saved.
 - Confirmed `UNAVAILABLE` resets `notify_phase` to `none` only if tickets were previously confirmed available, and clears `alerted_sites` with it.
 - No `alerted_sites` yet counts as nothing announced, so the next check announces every cinema selling. Assuming an earlier alert covered them all would silently swallow any cinema that started selling since — SM Mall of Asia did just that the day this was written.
 

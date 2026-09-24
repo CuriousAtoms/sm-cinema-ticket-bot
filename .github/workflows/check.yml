@@ -66,6 +66,10 @@ jobs:
       - name: Run ticket checker on a loop
         env:
           MOVIE_URL: ${{ secrets.MOVIE_URL }}
+          # Also watch every listing with this in its title. SM Cinema lists each
+          # format (IMAX, Infinity Vision, ...) as a separate film with its own
+          # sessions, so MOVIE_URL alone only ever sees one of them.
+          WATCH_TITLE: Doomsday
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           MENTION: ${{ secrets.MENTION }}
         run: |
