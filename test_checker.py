@@ -1506,5 +1506,292 @@ class TestInjectedSessionWorksWithoutRequests(unittest.TestCase):
                           "injected session" % fn.__name__)
 
 
+# SM Mall of Asia's two Avengers: Doomsday (Infinity Vision) sessions as the
+# live API reported them on 2026-09-24: both 272/272 sold, while
+# /films/HO00001619/availability still said ['ComingSoon'].
+MOA_SOLD_OUT_SEATS = [
+    {
+        "showtimeId": "2022-36756",
+        "isSoldOut": True,
+        "seatSummary": {"totalCount": 272, "availableCount": 0},
+        "areaCategorySeatSummaries": [
+            {"areaCategoryId": "0000000009", "totalCount": 272, "availableCount": 0}
+        ],
+    },
+    {
+        "showtimeId": "2022-36757",
+        "isSoldOut": True,
+        "seatSummary": {"totalCount": 272, "availableCount": 0},
+        "areaCategorySeatSummaries": [
+            {"areaCategoryId": "0000000009", "totalCount": 272, "availableCount": 0}
+        ],
+    },
+]
+
+# Same two sessions, one of them with seats left.
+MOA_ONE_BOOKABLE_SEATS = [
+    dict(MOA_SOLD_OUT_SEATS[0], isSoldOut=False,
+         seatSummary={"totalCount": 272, "availableCount": 40}),
+    MOA_SOLD_OUT_SEATS[1],
+]
+
+
+class FakeDigitalApi:
+    """
+    A session whose get() answers like smcinema.com and digital-api.
+
+    Enforces the real API's rules where they matter — siteIds is required and
+    capped at five per request — and answers only for the cinemas asked about.
+    `screenings` maps site ID -> business dates; `seats` maps site ID ->
+    showtimeAvailabilities; `fail` maps an endpoint path -> the response (or
+    exception) it should produce instead.
+    """
+
+    PAGE = ('<script id="__NEXT_DATA__" type="application/json">'
+            '{"props":{"pageProps":{"environment":{"gasToken":"tok"}}}}</script>')
+
+    def __init__(self, categories=("ComingSoon",), sites=None, screenings=None,
+                 seats=None, fail=None):
+        self.categories = list(categories)
+        if sites is None:
+            sites = {str(2000 + n): "SM Cinema %d" % n for n in range(78)}
+            sites["2022"] = "SM Mall of Asia"
+        self.sites = sites
+        self.screenings = screenings or {}
+        self.seats = seats or {}
+        self.fail = fail or {}
+        self.calls = []
+
+    def get(self, url, params=None, headers=None, timeout=None):
+        if "/ocapi/v1/" not in url:
+            return MockResponse(200, self.PAGE)
+        path = url.split("/ocapi/v1/", 1)[1]
+        self.calls.append((path, params))
+
+        if path in self.fail:
+            outcome = self.fail[path]
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        if path == "films/HO00001619/availability":
+            return MockResponse(200, json_data={"filmAvailability": {
+                "filmId": "HO00001619", "siteId": None, "categories": self.categories,
+                "showtimeAttributeIds": [], "advanceBookingPeriods": []}})
+        if path == "films/HO00001619":
+            return MockResponse(200, json_data={
+                "film": {"title": {"text": "Avengers: Doomsday (Infinity Vision)"}}})
+        if path == "sites":
+            return MockResponse(200, json_data={"sites": [
+                {"id": site_id, "name": {"text": name}} for site_id, name in self.sites.items()]})
+
+        site_ids = list((params or {}).get("siteIds") or [])
+        if not site_ids:
+            return MockResponse(400, json_data={"detail": "siteIds field cannot be empty."})
+        if len(site_ids) > 5:
+            return MockResponse(400, json_data={
+                "detail": "Cannot filter by more than 5 site identifiers."})
+
+        if path == "film-screening-dates":
+            by_date = {}
+            for site_id in site_ids:
+                for date in self.screenings.get(site_id, []):
+                    by_date.setdefault(date, []).append(
+                        {"siteId": site_id, "showtimeAttributeIds": ["0000000030"]})
+            return MockResponse(200, json_data={"filmScreeningDates": [
+                {"businessDate": date,
+                 "filmScreenings": [{"filmId": "HO00001619", "sites": sites}]}
+                for date, sites in sorted(by_date.items())]})
+        if path == "showtimes/availability":
+            return MockResponse(200, json_data={"showtimeAvailabilities": [
+                seat for site_id in site_ids for seat in self.seats.get(site_id, [])]})
+        raise AssertionError("unexpected request: %s" % path)
+
+
+class TestSessionSweep(unittest.TestCase):
+    """
+    Regression tests for the missed Avengers: Doomsday (Infinity Vision) sale.
+
+    66 sessions went on sale at three cinemas while /films/<id>/availability
+    still said ['ComingSoon'] with no advance booking period — film-wide and
+    for each of those cinemas — so a check that trusted the categories alone
+    reported "no tickets" on every single run.
+    """
+
+    URL = "https://www.smcinema.com/films/Avengers-Doomsday/HO00001619"
+
+    def check(self, api):
+        return checker._check_availability_api_single(self.URL, session=api)
+
+    def test_bookable_session_is_available_despite_coming_soon(self):
+        api = FakeDigitalApi(screenings={"2022": ["2026-12-16"]},
+                             seats={"2022": MOA_ONE_BOOKABLE_SEATS})
+        res = self.check(api)
+        self.assertEqual(res["status"], "AVAILABLE")
+        self.assertEqual(checker.determine_booking_phase(res), "open")
+        self.assertEqual(
+            res["signals_found"],
+            ["1 of 2 sessions bookable at 1 cinema (SM Mall of Asia), from December 16, 2026"],
+        )
+
+    def test_the_sold_out_premiere_is_unavailable(self):
+        """Nothing is buyable, and alerting now would spend the alert for when seats appear."""
+        api = FakeDigitalApi(screenings={"2022": ["2026-12-16"]},
+                             seats={"2022": MOA_SOLD_OUT_SEATS})
+        res = self.check(api)
+        self.assertEqual(res["status"], "UNAVAILABLE")
+        self.assertIn(
+            "all 2 sessions sold out at 1 cinema (SM Mall of Asia), from December 16, 2026",
+            res["unavailable_signals"],
+        )
+
+    def test_no_sessions_anywhere_is_unavailable(self):
+        res = self.check(FakeDigitalApi())
+        self.assertEqual(res["status"], "UNAVAILABLE")
+        self.assertIn("no sessions at any of 78 cinemas", res["unavailable_signals"])
+
+    def test_every_cinema_is_swept_within_the_five_site_cap(self):
+        api = FakeDigitalApi()
+        self.check(api)
+        batches = [params["siteIds"] for path, params in api.calls
+                   if path == "film-screening-dates"]
+        self.assertTrue(all(1 <= len(batch) <= 5 for batch in batches))
+        self.assertEqual(sorted(s for batch in batches for s in batch), sorted(api.sites))
+
+    def test_seats_are_only_fetched_where_the_film_screens(self):
+        api = FakeDigitalApi(screenings={"2022": ["2026-12-16"]},
+                             seats={"2022": MOA_SOLD_OUT_SEATS})
+        self.check(api)
+        seat_batches = [params["siteIds"] for path, params in api.calls
+                        if path == "showtimes/availability"]
+        self.assertEqual(seat_batches, [["2022"]])
+
+    def test_categories_that_already_say_available_skip_the_sweep(self):
+        api = FakeDigitalApi(categories=["NowShowing"])
+        res = self.check(api)
+        self.assertEqual(res["status"], "AVAILABLE")
+        swept = [path for path, _ in api.calls
+                 if path in ("sites", "film-screening-dates", "showtimes/availability")]
+        self.assertEqual(swept, [])
+
+    def test_screenings_without_seat_data_still_alert(self):
+        api = FakeDigitalApi(screenings={"2022": ["2026-12-16"]})
+        res = self.check(api)
+        self.assertEqual(res["status"], "AVAILABLE")
+        self.assertIn("seat availability unknown", res["signals_found"][0])
+
+    def test_no_content_reads_as_no_sessions(self):
+        api = FakeDigitalApi(fail={"film-screening-dates": MockResponse(204)})
+        self.assertEqual(self.check(api)["status"], "UNAVAILABLE")
+
+    def test_refused_sweep_is_hard_and_says_why(self):
+        """A tighter site cap would blind the sweep for good, so it must go red and explain."""
+        api = FakeDigitalApi(fail={"film-screening-dates": MockResponse(
+            400, json_data={"detail": "Cannot filter by more than 3 site identifiers."})})
+        res = self.check(api)
+        self.assertEqual(res["status"], "ERROR")
+        self.assertTrue(res["hard"])
+        self.assertIn("Cannot filter by more than 3 site identifiers.", res["error_reason"])
+
+    def test_transient_sweep_failures_are_soft(self):
+        for outcome in (MockResponse(503, "unavailable"), MockResponse(429, "slow down"),
+                        checker.RequestTimeout("timed out")):
+            with self.subTest(outcome=outcome):
+                api = FakeDigitalApi(screenings={"2022": ["2026-12-16"]},
+                                     fail={"showtimes/availability": outcome})
+                res = self.check(api)
+                self.assertEqual(res["status"], "ERROR")
+                self.assertFalse(res["hard"])
+
+    def test_sweep_schema_drift_is_hard(self):
+        drifted = {
+            "sites": MockResponse(200, json_data={"cinemas": []}),
+            "film-screening-dates": MockResponse(200, json_data={"dates": []}),
+            "showtimes/availability": MockResponse(200, json_data={"seats": []}),
+        }
+        for path, response in drifted.items():
+            with self.subTest(path=path):
+                api = FakeDigitalApi(screenings={"2022": ["2026-12-16"]},
+                                     fail={path: response})
+                res = self.check(api)
+                self.assertEqual(res["status"], "ERROR")
+                self.assertTrue(res["hard"])
+                self.assertIn("schema drift", res["error_reason"])
+
+    def test_no_cinemas_listed_is_hard(self):
+        """Zero cinemas would make "no sessions anywhere" vacuously true."""
+        res = self.check(FakeDigitalApi(sites={}))
+        self.assertEqual(res["status"], "ERROR")
+        self.assertTrue(res["hard"])
+
+    def test_screening_days_without_readable_cinemas_are_hard(self):
+        unreadable = MockResponse(200, json_data={"filmScreeningDates": [
+            {"businessDate": "2026-12-16",
+             "filmScreenings": [{"filmId": "HO00001619", "venues": [{"id": "2022"}]}]}]})
+        res = self.check(FakeDigitalApi(fail={"film-screening-dates": unreadable}))
+        self.assertEqual(res["status"], "ERROR")
+        self.assertTrue(res["hard"])
+
+    def test_the_missed_alert_now_fires_end_to_end(self):
+        """ComingSoon categories plus a bookable session: main() alerts and records 'open'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_file = os.path.join(tmp, "state.json")
+            with open(state_file, "w", encoding="utf-8") as f:
+                json.dump({"notify_phase": "none", "last_status": "unavailable",
+                           "film_id": "HO00001619"}, f)
+            api = FakeDigitalApi(screenings={"2022": ["2026-12-16"]},
+                                 seats={"2022": MOA_ONE_BOOKABLE_SEATS})
+            fake_requests = unittest.mock.Mock()
+            fake_requests.Session.return_value = api
+
+            with patch.dict(os.environ, {"SKIP_INITIAL_DELAY": "1", "USE_BROWSER_FALLBACK": ""}), \
+                 patch.object(checker, "STATE_FILE", state_file), \
+                 patch.object(checker, "MOVIE_URL", self.URL), \
+                 patch.object(checker, "requests", fake_requests), \
+                 patch.object(checker, "send_discord_notification", return_value=True) as send:
+                checker.main([])
+
+            send.assert_called_once()
+            sent = send.call_args[0][0]
+            self.assertEqual(sent["film_title"], "Avengers: Doomsday (Infinity Vision)")
+            self.assertIn("SM Mall of Asia", sent["signals_found"][0])
+            with open(state_file, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"notify_phase": "open", "last_status": "available",
+                                                "film_id": "HO00001619"})
+
+
+class TestEvaluateSessions(unittest.TestCase):
+    """The pure decision over swept sessions."""
+
+    NAMES = {"2022": "SM Mall of Asia", "2031": "SM Megamall"}
+
+    def test_missing_sold_out_flag_counts_as_bookable(self):
+        status, _, _ = checker.evaluate_sessions(
+            {"2022": {"2026-12-16"}}, [{"showtimeId": "2022-1"}], self.NAMES)
+        self.assertEqual(status, "AVAILABLE")
+
+    def test_zero_seats_left_is_sold_out_even_without_the_flag(self):
+        status, _, _ = checker.evaluate_sessions(
+            {"2022": {"2026-12-16"}},
+            [{"showtimeId": "2022-1", "isSoldOut": False,
+              "seatSummary": {"totalCount": 272, "availableCount": 0}}],
+            self.NAMES)
+        self.assertEqual(status, "UNAVAILABLE")
+
+    def test_earliest_date_and_every_cinema_are_named(self):
+        screenings = {"2022": {"2026-12-17", "2026-12-16"}, "2031": {"2026-12-20"}}
+        _, found, _ = checker.evaluate_sessions(screenings, [{"isSoldOut": False}], self.NAMES)
+        self.assertEqual(
+            found, ["1 of 1 sessions bookable at 2 cinemas (SM Mall of Asia, SM Megamall), "
+                    "from December 16, 2026"])
+
+    def test_cinema_list_fits_a_discord_embed_field(self):
+        """Discord rejects the whole alert when a field value passes 1024 characters."""
+        names = {str(n): "SM City With A Deliberately Long Cinema Name %d" % n for n in range(78)}
+        screenings = {site_id: {"2026-12-16"} for site_id in names}
+        _, found, _ = checker.evaluate_sessions(screenings, [{"isSoldOut": False}], names)
+        self.assertIn("+73 more", found[0])
+        self.assertLess(len(found[0]), 1024)
+
+
 if __name__ == "__main__":
     unittest.main()

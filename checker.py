@@ -736,6 +736,8 @@ def evaluate_availability(film_availability):
       1. 'AdvanceBooking' in categories, or advanceBookingPeriods non-empty -> AVAILABLE
       2. 'NowShowing' in categories                                        -> AVAILABLE
       3. categories == ['ComingSoon'] alone                                -> UNAVAILABLE
+         (provisional: the API check then looks for real sessions, see
+         evaluate_sessions — categories alone missed a real on-sale)
       4. showtimeAttributeIds is completely IGNORED (these are format tags
          like 2D/3D/IMAX assigned long before tickets go on sale).
       5. A category value outside {ComingSoon, NowShowing, AdvanceBooking} -> AVAILABLE
@@ -791,6 +793,206 @@ def evaluate_availability(film_availability):
         return AvailabilityEvaluation("UNAVAILABLE", [], [f"categories: {categories}"], None)
 
     return AvailabilityEvaluation("ERROR", [], [], f"Unhandled categories shape: {categories}")
+
+
+# ── Session Check (what categories can miss) ───────────────────────────────────
+
+# The showtime endpoints refuse more than five cinemas per request (HTTP 400
+# "Cannot filter by more than 5 site identifiers."), so a sweep of every
+# cinema has to go out in batches of this size.
+SITES_PER_REQUEST = 5
+
+# Cinemas named in a session signal before the rest collapse into "+N more".
+# Signals land in a Discord embed field, and Discord rejects the whole message
+# when a field exceeds 1024 characters — so the list must stay bounded.
+MAX_CINEMAS_NAMED = 5
+
+
+def _ocapi_list(session, gas_token, path, key, params=None):
+    """
+    GET one digital-api endpoint and return the list stored under `key`.
+
+    Returns (items, None), reading 204 No Content as an empty list, or
+    (None, error_result). Any 4xx except a 429 throttle is hard: the API
+    refused the request itself — a rejected token, or a query shape it no
+    longer accepts — and no retry can fix that.
+    """
+    url = f"https://digital-api.smcinema.com/ocapi/v1/{path}"
+    headers = {
+        "Authorization": f"Bearer {gas_token}",
+        "Accept": "application/json",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+    try:
+        resp = session.get(url, params=params, headers=headers, timeout=15)
+    except (RequestTimeout, RequestConnectionError) as e:
+        return None, error_result(f"{path} network error: {e}", page_title="API Network Error", hard=False)
+    except Exception as e:
+        return None, error_result(f"{path} request error: {e}", page_title="API Error", hard=False)
+
+    status = resp.status_code
+    if status == 204:
+        return [], None
+    if status != 200:
+        # Vista answers errors with problem+json, whose `detail` names the
+        # actual complaint, e.g. "Cannot filter by more than 5 site identifiers."
+        try:
+            detail = resp.json().get("detail")
+        except Exception:
+            detail = None
+        reason = f"{path} returned HTTP {status}"
+        if isinstance(detail, str) and detail.strip():
+            reason += f": {detail.strip()}"
+        hard = 400 <= status < 500 and status != 429
+        return None, error_result(reason, page_title=f"HTTP {status}", hard=hard)
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        return None, error_result(f"{path} response is not valid JSON: {e}", page_title="JSON Error", hard=True)
+
+    items = data.get(key) if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None, error_result(
+            f"{path} response missing '{key}' list (schema drift)",
+            page_title="Schema Drift",
+            hard=True,
+        )
+    return items, None
+
+
+def fetch_film_sessions(film_id, gas_token, session):
+    """
+    Sweep every SM Cinema site for the film's scheduled sessions.
+
+    Mirrors what the film page does once a visitor picks a cinema:
+    film-screening-dates says where and when the film plays, then
+    showtimes/availability says whether those sessions still have seats. The
+    page only ever asks about the cinemas a visitor selected, so nothing on it
+    reveals a session at any other cinema.
+
+    Returns ((screenings, seats, site_names), None) or (None, error_result):
+      screenings  {site_id: {business_date, ...}}
+      seats       showtimeAvailabilities for the cinemas that have screenings
+      site_names  {site_id: cinema name}
+    """
+    sites, err = _ocapi_list(session, gas_token, "sites", "sites")
+    if err:
+        return None, err
+
+    site_names = {}
+    for site in sites:
+        if isinstance(site, dict) and site.get("id"):
+            name = site.get("name")
+            text = name.get("text") if isinstance(name, dict) else name
+            site_names[str(site["id"])] = text if isinstance(text, str) and text else str(site["id"])
+    if not site_names:
+        # With zero cinemas, "no sessions anywhere" would be vacuously true.
+        return None, error_result(
+            "sites returned no cinemas, so sessions cannot be checked",
+            page_title="Schema Drift",
+            hard=True,
+        )
+
+    site_ids = sorted(site_names)
+    screenings = {}
+    for i in range(0, len(site_ids), SITES_PER_REQUEST):
+        days, err = _ocapi_list(
+            session, gas_token, "film-screening-dates", "filmScreeningDates",
+            params={"filmIds": film_id, "siteIds": site_ids[i:i + SITES_PER_REQUEST]},
+        )
+        if err:
+            return None, err
+        found_before = len(screenings)
+        for day in days:
+            if not isinstance(day, dict):
+                continue
+            date = day.get("businessDate")
+            for screening in day.get("filmScreenings") or []:
+                if not isinstance(screening, dict):
+                    continue
+                for site in screening.get("sites") or []:
+                    if isinstance(site, dict) and site.get("siteId"):
+                        dates = screenings.setdefault(str(site["siteId"]), set())
+                        if isinstance(date, str):
+                            dates.add(date)
+        if days and len(screenings) == found_before:
+            # The API says the film screens somewhere in this batch, but not in
+            # a shape that says where. Guessing "nowhere" is the silent miss
+            # this sweep exists to prevent.
+            return None, error_result(
+                "film-screening-dates listed screening days without readable cinemas (schema drift)",
+                page_title="Schema Drift",
+                hard=True,
+            )
+
+    seats = []
+    screened_sites = sorted(screenings)
+    for i in range(0, len(screened_sites), SITES_PER_REQUEST):
+        items, err = _ocapi_list(
+            session, gas_token, "showtimes/availability", "showtimeAvailabilities",
+            params={"filmIds": film_id, "siteIds": screened_sites[i:i + SITES_PER_REQUEST]},
+        )
+        if err:
+            return None, err
+        seats.extend(item for item in items if isinstance(item, dict))
+
+    return (screenings, seats, site_names), None
+
+
+def _is_sold_out(seat_info):
+    """Sold out if either field says so; a session with missing data counts as having seats."""
+    if seat_info.get("isSoldOut") is True:
+        return True
+    summary = seat_info.get("seatSummary")
+    available = summary.get("availableCount") if isinstance(summary, dict) else None
+    return isinstance(available, int) and available <= 0
+
+
+def _describe_screenings(screenings, site_names):
+    """e.g. '2 cinemas (SM Mall of Asia, SM Megamall), from December 16, 2026'."""
+    names = sorted(site_names.get(site_id, site_id) for site_id in screenings)
+    shown = ", ".join(names[:MAX_CINEMAS_NAMED])
+    if len(names) > MAX_CINEMAS_NAMED:
+        shown += f" +{len(names) - MAX_CINEMAS_NAMED} more"
+    noun = "cinema" if len(names) == 1 else "cinemas"
+    text = f"{len(names)} {noun} ({shown})"
+
+    dates = sorted(date for site_dates in screenings.values() for date in site_dates)
+    if dates:
+        try:
+            earliest = datetime.strptime(dates[0], "%Y-%m-%d").strftime("%B %d, %Y")
+        except ValueError:
+            earliest = dates[0]
+        text += f", from {earliest}"
+    return text
+
+
+def evaluate_sessions(screenings, seats, site_names):
+    """
+    Decide availability from the film's actual sessions.
+
+    Returns (status, found_available, found_unavailable):
+      no screening at any cinema              -> UNAVAILABLE
+      any session with a seat left            -> AVAILABLE
+      screenings, but no seat data for them   -> AVAILABLE (bias toward alerting)
+      every session sold out                  -> UNAVAILABLE
+
+    Sold out counts as unavailable on purpose. An alert for seats nobody can buy
+    would also spend the single "open" alert, leaving nothing to fire when
+    bookable sessions finally appear.
+    """
+    if not screenings:
+        return "UNAVAILABLE", [], [f"no sessions at any of {len(site_names)} cinemas"]
+
+    where = _describe_screenings(screenings, site_names)
+    if not seats:
+        return "AVAILABLE", [f"sessions scheduled at {where} (seat availability unknown)"], []
+
+    bookable = sum(1 for seat_info in seats if not _is_sold_out(seat_info))
+    if bookable:
+        return "AVAILABLE", [f"{bookable} of {len(seats)} sessions bookable at {where}"], []
+    return "UNAVAILABLE", [], [f"all {len(seats)} sessions sold out at {where}"]
 
 
 def _check_availability_api_single(movie_url, session=None):
@@ -967,6 +1169,22 @@ def _check_availability_api_single(movie_url, session=None):
     if status == "ERROR":
         print(f"[ERROR] [API] {error_reason}")
         return error_result(error_reason, page_title=page_title, hard=True)
+
+    # Step 5: ['ComingSoon'] is not proof there is nothing to buy. Avengers:
+    # Doomsday (Infinity Vision) had 66 sessions on sale at three cinemas while
+    # this endpoint still said ['ComingSoon'] with no advance booking period —
+    # film-wide and for each of those cinemas. So before calling a film
+    # unavailable, look for the sessions themselves.
+    if status == "UNAVAILABLE":
+        print("[CHECK] [API] Categories say unavailable; checking every cinema for sessions...")
+        sessions, session_error = fetch_film_sessions(film_id, gas_token, session)
+        if session_error:
+            print(f"[ERROR] [API] Session check failed: {session_error['error_reason']}")
+            return session_error
+        status, session_avail, session_unavail = evaluate_sessions(*sessions)
+        found_avail = found_avail + session_avail
+        found_unavail = found_unavail + session_unavail
+        print(f"[CHECK] [API] Sessions: {'; '.join(session_avail + session_unavail)}")
 
     if status == "AVAILABLE":
         if earliest_starts_at:

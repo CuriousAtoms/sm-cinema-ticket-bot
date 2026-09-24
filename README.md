@@ -7,7 +7,8 @@ An automated ticket availability monitor for **Avengers: Doomsday** at **SM Cine
 ## 🚀 Features
 
 - **Automated Monitoring:** Checks every 5 minutes, from a loop inside a long-running GitHub Actions job rather than from the cron itself — see [Why the cron is only a starter](#-why-the-cron-is-only-a-starter).
-- **Direct JSON API First:** Directly queries SM Cinema's internal backend (`digital-api.smcinema.com/ocapi/v1/films/<ID>/availability`) using the JWT `gasToken` extracted from the page's Next.js SSR hydration data (`__NEXT_DATA__`). Completes in ~1-2 seconds with minimal bandwidth and zero browser footprint.
+- **Direct JSON API First:** Directly queries SM Cinema's internal backend (`digital-api.smcinema.com/ocapi/v1/films/<ID>/availability`) using the JWT `gasToken` extracted from the page's Next.js SSR hydration data (`__NEXT_DATA__`). Completes in a few seconds with minimal bandwidth and zero browser footprint.
+- **Session Sweep:** While the film is still categorised `ComingSoon`, every cinema is checked for real sessions — SM Cinema can put tickets on sale without changing the category. See [Why categories are not enough](#why-categories-are-not-enough).
 - **Opt-In Browser Fallback:** Retains the full Playwright headless browser implementation (with bot-evasion masks) via `USE_BROWSER_FALLBACK=1` and a manual `check-browser.yml` workflow.
 - **Robust Error Classification:** Soft errors (network timeouts, Cloudflare 403/429 rate limits, 5xx server errors) are automatically retried with exponential backoff. Hard errors (404 Not Found, auth rejection, schema drift) fail loudly to trigger GitHub alert notifications.
 - **Scoped Signal Matching & Interim Decision Rules:** Evaluates film availability categories, advance booking periods, and showtimes with conservative defaults biased toward alerting.
@@ -296,11 +297,34 @@ python checker.py
 |---|---|
 | `'AdvanceBooking'` in categories, or `advanceBookingPeriods` non-empty | `AVAILABLE` (carries earliest `startsAt`) |
 | `'NowShowing'` in categories | `AVAILABLE` |
-| `categories` contains only `'ComingSoon'` alone | `UNAVAILABLE` |
+| `categories` contains only `'ComingSoon'` | Not trusted on its own — decided by the session sweep below |
 | `showtimeAttributeIds` | Completely ignored (format tags like 2D/3D/IMAX) |
 | Category value outside `{ComingSoon, NowShowing, AdvanceBooking}` | `AVAILABLE` (logged loudly as unrecognised) |
 | Missing `filmAvailability`, unrecognised shape, or 401/403/404 | `ERROR` (hard) — run fails, state untouched |
 | Network timeout, Cloudflare 403/429, or 5xx server error | `ERROR` (soft) — auto-retried up to 3 times with backoff |
+
+### Session Sweep (only while categories say `ComingSoon`)
+| Situation | Result |
+|---|---|
+| Any session at any cinema still has seats | `AVAILABLE` (open now) — the alert names the cinemas and first date |
+| Sessions exist, but every one is sold out | `UNAVAILABLE` — nothing to buy, so the alert is saved for when seats appear |
+| No sessions at any cinema | `UNAVAILABLE` |
+| Screenings listed, but no seat data returned | `AVAILABLE` (bias toward alerting) |
+| A sweep request is refused (4xx), or its response changes shape | `ERROR` (hard) — the `detail` from the API is logged |
+| A sweep request times out, is throttled (429), or gets a 5xx | `ERROR` (soft) — retried with the rest of the check |
+
+#### Why categories are not enough
+Avengers: Doomsday (Infinity Vision) went on sale at SM Megamall, SM City Fairview
+and SM Mall of Asia while `/availability` still said `['ComingSoon']` with no
+advance booking period — for the film, and for each of those cinemas. The film page
+did not help either: it only lists sessions for the cinemas a visitor has picked.
+So the bot reported "no tickets" every five minutes while 66 sessions were on sale.
+
+The sweep asks the questions the film page asks, but for every cinema:
+`/sites`, then `/film-screening-dates` to see where and when the film plays, then
+`/showtimes/availability` for seats at just those cinemas. Both showtime endpoints
+refuse more than five cinemas per request, so all ~78 cinemas take 16 batched calls.
+None of this runs once the categories themselves say the film is available.
 
 ### Fallback: Headless Browser (`USE_BROWSER_FALLBACK=1`)
 | Situation | Result |
