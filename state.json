@@ -1,5 +1,5 @@
 {
-  "notify_phase": "none",
-  "last_status": "unavailable",
+  "notify_phase": "open",
+  "last_status": "available",
   "film_id": "HO00001619"
 }
