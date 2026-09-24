@@ -299,14 +299,23 @@ def load_state():
                 if not isinstance(film_id, str) or not film_id.strip():
                     film_id = None
 
+                # Cinemas already announced for the current phase. None means
+                # unknown: absent on state files written before cinema tracking.
+                alerted_sites = data.get("alerted_sites")
+                if not isinstance(alerted_sites, list) or not all(
+                    isinstance(site_id, str) for site_id in alerted_sites
+                ):
+                    alerted_sites = None
+
                 return {
                     "notify_phase": notify_phase,
                     "last_status": last_status,
                     "film_id": film_id,
+                    "alerted_sites": alerted_sites,
                 }
         except Exception as e:
             print(f"[STATE] Error loading {STATE_FILE}: {e}. Initializing fresh state.")
-    return {"notify_phase": "none", "last_status": "unavailable", "film_id": None}
+    return {"notify_phase": "none", "last_status": "unavailable", "film_id": None, "alerted_sites": None}
 
 
 def save_state(state):
@@ -321,6 +330,11 @@ def save_state(state):
         film_id = state.get("film_id")
         if isinstance(film_id, str) and film_id.strip():
             payload["film_id"] = film_id.strip()
+        # Which cinemas an alert has already named, so a cinema that starts
+        # selling later gets an alert of its own. Omitted while unknown.
+        alerted_sites = state.get("alerted_sites")
+        if isinstance(alerted_sites, list):
+            payload["alerted_sites"] = sorted(alerted_sites)
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
             f.write("\n")
@@ -871,10 +885,10 @@ def fetch_film_sessions(film_id, gas_token, session):
     page only ever asks about the cinemas a visitor selected, so nothing on it
     reveals a session at any other cinema.
 
-    Returns ((screenings, seats, site_names), None) or (None, error_result):
-      screenings  {site_id: {business_date, ...}}
-      seats       showtimeAvailabilities for the cinemas that have screenings
-      site_names  {site_id: cinema name}
+    Returns ((screenings, seats_by_site, site_names), None) or (None, error_result):
+      screenings     {site_id: {business_date, ...}}
+      seats_by_site  {site_id: [showtimeAvailability, ...]} for screened cinemas
+      site_names     {site_id: cinema name}
     """
     sites, err = _ocapi_list(session, gas_token, "sites", "sites")
     if err:
@@ -926,18 +940,51 @@ def fetch_film_sessions(film_id, gas_token, session):
                 hard=True,
             )
 
-    seats = []
+    seats_by_site = {}
     screened_sites = sorted(screenings)
     for i in range(0, len(screened_sites), SITES_PER_REQUEST):
-        items, err = _ocapi_list(
-            session, gas_token, "showtimes/availability", "showtimeAvailabilities",
-            params={"filmIds": film_id, "siteIds": screened_sites[i:i + SITES_PER_REQUEST]},
-        )
+        batch = screened_sites[i:i + SITES_PER_REQUEST]
+        items, err = _fetch_seats(session, gas_token, film_id, batch)
         if err:
             return None, err
-        seats.extend(item for item in items if isinstance(item, dict))
+        by_site = _seats_by_site(items, batch)
+        if by_site is None:
+            # Showtime IDs have always started with their cinema's ID
+            # ("2022-36756"), and seat records carry nothing else to place them
+            # by. If that ever stops holding, ask one cinema at a time.
+            by_site = {}
+            for site_id in batch:
+                items, err = _fetch_seats(session, gas_token, film_id, [site_id])
+                if err:
+                    return None, err
+                by_site[site_id] = items
+        seats_by_site.update(by_site)
 
-    return (screenings, seats, site_names), None
+    return (screenings, seats_by_site, site_names), None
+
+
+def _fetch_seats(session, gas_token, film_id, site_ids):
+    """showtimeAvailabilities for the film at up to SITES_PER_REQUEST cinemas."""
+    items, err = _ocapi_list(
+        session, gas_token, "showtimes/availability", "showtimeAvailabilities",
+        params={"filmIds": film_id, "siteIds": site_ids},
+    )
+    if err:
+        return None, err
+    return [item for item in items if isinstance(item, dict)], None
+
+
+def _seats_by_site(items, batch):
+    """Split seat records by cinema, or None if any record cannot be placed."""
+    if len(batch) == 1:
+        return {batch[0]: items}
+    by_site = {}
+    for item in items:
+        site_id = str(item.get("showtimeId") or "").split("-", 1)[0]
+        if site_id not in batch:
+            return None
+        by_site.setdefault(site_id, []).append(item)
+    return by_site
 
 
 def _is_sold_out(seat_info):
@@ -968,31 +1015,73 @@ def _describe_screenings(screenings, site_names):
     return text
 
 
-def evaluate_sessions(screenings, seats, site_names):
+def cinema_url(site_id, name):
+    """
+    A cinema's page, e.g. https://www.smcinema.com/sites/SM-Megamall/2102.
+
+    Same shape as the film URLs: the site resolves the page from the trailing
+    ID, and the slug matches the site's own links for all 78 cinemas.
+    """
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", name or "").strip("-") or site_id
+    return f"https://www.smcinema.com/sites/{slug}/{site_id}"
+
+
+def evaluate_sessions(screenings, seats_by_site, site_names):
     """
     Decide availability from the film's actual sessions.
 
-    Returns (status, found_available, found_unavailable):
+    Returns (status, found_available, found_unavailable, cinemas):
       no screening at any cinema              -> UNAVAILABLE
       any session with a seat left            -> AVAILABLE
-      screenings, but no seat data for them   -> AVAILABLE (bias toward alerting)
+      screenings, but no seat data for any    -> AVAILABLE (bias toward alerting)
       every session sold out                  -> UNAVAILABLE
+
+    `cinemas` lists where you can book right now, alphabetically, each as
+    {"id", "name", "url", "sessions", "first_date"}; "sessions" counts the ones
+    with seats left, and is None when no seat data came back at all.
 
     Sold out counts as unavailable on purpose. An alert for seats nobody can buy
     would also spend the single "open" alert, leaving nothing to fire when
     bookable sessions finally appear.
+
+    The seat endpoint drops sessions once they start, so a cinema with no seat
+    records while others have some has nothing left to sell, and is not listed.
     """
     if not screenings:
-        return "UNAVAILABLE", [], [f"no sessions at any of {len(site_names)} cinemas"]
+        return "UNAVAILABLE", [], [f"no sessions at any of {len(site_names)} cinemas"], []
+
+    def listing(site_id, sessions):
+        name = site_names.get(site_id, site_id)
+        dates = screenings[site_id]
+        return {
+            "id": site_id,
+            "name": name,
+            "url": cinema_url(site_id, name),
+            "sessions": sessions,
+            "first_date": min(dates) if dates else None,
+        }
+
+    counts = {}
+    for site_id in screenings:
+        seats = seats_by_site.get(site_id) or []
+        counts[site_id] = (len(seats), sum(1 for seat_info in seats if not _is_sold_out(seat_info)))
+    total = sum(n for n, _ in counts.values())
+    bookable = sum(n for _, n in counts.values())
+
+    def by_name(cinema):
+        return cinema["name"].lower()
 
     where = _describe_screenings(screenings, site_names)
-    if not seats:
-        return "AVAILABLE", [f"sessions scheduled at {where} (seat availability unknown)"], []
+    if not total:
+        cinemas = sorted((listing(site_id, None) for site_id in screenings), key=by_name)
+        return "AVAILABLE", [f"sessions scheduled at {where} (seat availability unknown)"], [], cinemas
 
-    bookable = sum(1 for seat_info in seats if not _is_sold_out(seat_info))
-    if bookable:
-        return "AVAILABLE", [f"{bookable} of {len(seats)} sessions bookable at {where}"], []
-    return "UNAVAILABLE", [], [f"all {len(seats)} sessions sold out at {where}"]
+    cinemas = sorted(
+        (listing(site_id, n) for site_id, (_, n) in counts.items() if n), key=by_name
+    )
+    if cinemas:
+        return "AVAILABLE", [f"{bookable} of {total} sessions bookable at {where}"], [], cinemas
+    return "UNAVAILABLE", [], [f"all {total} sessions sold out at {where}"], []
 
 
 def _check_availability_api_single(movie_url, session=None):
@@ -1170,18 +1259,31 @@ def _check_availability_api_single(movie_url, session=None):
         print(f"[ERROR] [API] {error_reason}")
         return error_result(error_reason, page_title=page_title, hard=True)
 
-    # Step 5: ['ComingSoon'] is not proof there is nothing to buy. Avengers:
-    # Doomsday (Infinity Vision) had 66 sessions on sale at three cinemas while
-    # this endpoint still said ['ComingSoon'] with no advance booking period —
-    # film-wide and for each of those cinemas. So before calling a film
-    # unavailable, look for the sessions themselves.
-    if status == "UNAVAILABLE":
-        print("[CHECK] [API] Categories say unavailable; checking every cinema for sessions...")
-        sessions, session_error = fetch_film_sessions(film_id, gas_token, session)
-        if session_error:
-            print(f"[ERROR] [API] Session check failed: {session_error['error_reason']}")
-            return session_error
-        status, session_avail, session_unavail = evaluate_sessions(*sessions)
+    # Step 5: Sweep every cinema for the sessions themselves.
+    #
+    # ['ComingSoon'] is not proof there is nothing to buy: Avengers: Doomsday
+    # (Infinity Vision) had 66 sessions on sale at three cinemas while this
+    # endpoint still said ['ComingSoon'] with no advance booking period —
+    # film-wide and for each of those cinemas. So when the categories say
+    # unavailable, the sweep decides. When they already say available it still
+    # runs, because it is what names the cinemas to book at, and what notices a
+    # cinema that starts selling later.
+    print("[CHECK] [API] Checking every cinema for sessions...")
+    sessions, sweep_error = fetch_film_sessions(film_id, gas_token, session)
+    cinemas = None
+    if sweep_error:
+        if status == "UNAVAILABLE":
+            print(f"[ERROR] [API] Session check failed: {sweep_error['error_reason']}")
+            return sweep_error
+        # A broken sweep must not swallow an alert the categories already
+        # justify, so it goes out without cinema links. main() still fails the
+        # run afterwards if the sweep is broken for good.
+        print(f"[WARN] [API] Session check failed ({sweep_error['error_reason']}); "
+              "going by the categories alone, without cinema links.")
+    else:
+        sweep_status, session_avail, session_unavail, cinemas = evaluate_sessions(*sessions)
+        if status == "UNAVAILABLE":
+            status = sweep_status
         found_avail = found_avail + session_avail
         found_unavail = found_unavail + session_unavail
         print(f"[CHECK] [API] Sessions: {'; '.join(session_avail + session_unavail)}")
@@ -1220,6 +1322,9 @@ def _check_availability_api_single(movie_url, session=None):
         "starts_at": earliest_starts_at,
         "film_title": film_title,
         "film_id": film_id,
+        # Where to book right now; None when the sweep could not run.
+        "cinemas": cinemas,
+        "sweep_error": sweep_error,
     }
 
 
@@ -1351,10 +1456,48 @@ def check_availability():
 
 # ── Discord Notification ───────────────────────────────────────────────────────
 
-def build_discord_payload(result, is_test=False):
+# Discord rejects the whole message when any embed field value is longer.
+DISCORD_FIELD_LIMIT = 1024
+
+
+def format_cinema_links(cinemas):
+    """
+    One linked line per cinema, trimmed to fit a single embed field, e.g.
+      [SM Megamall](https://www.smcinema.com/sites/SM-Megamall/2102) — 32 sessions from Dec 16
+    """
+    lines = []
+    for cinema in cinemas:
+        count = cinema.get("sessions")
+        detail = "sessions" if count is None else f"{count} session{'' if count == 1 else 's'}"
+        first_date = cinema.get("first_date")
+        if first_date:
+            try:
+                detail += " from " + datetime.strptime(first_date, "%Y-%m-%d").strftime("%b %d")
+            except ValueError:
+                detail += f" from {first_date}"
+        lines.append(f"[{cinema['name']}]({cinema['url']}) — {detail}")
+
+    # Leave room for the "+N more" line, which is never longer than this.
+    budget = DISCORD_FIELD_LIMIT - 40
+    shown, used = [], 0
+    for line in lines:
+        cost = len(line) + (1 if shown else 0)
+        if used + cost > budget:
+            break
+        shown.append(line)
+        used += cost
+    if len(shown) < len(lines):
+        shown.append(f"+{len(lines) - len(shown)} more on the film page")
+    return "\n".join(shown)
+
+
+def build_discord_payload(result, is_test=False, new_cinemas=None):
     """
     Build the formatted Discord embed payload.
     Uses startsAt to distinguish booking in the future ('opens at <time>') from active booking ('open now').
+
+    `new_cinemas` turns it into the follow-up alert for cinemas that started
+    selling after the first one, listing just those.
     """
     now_manila = get_manila_now()
     timestamp = now_manila.strftime("%B %d, %Y at %I:%M %p (PHT)")
@@ -1381,12 +1524,14 @@ def build_discord_payload(result, is_test=False):
     )
 
     timing_field = None
+    announced = False
     starts_at_str = result.get("startsAt") or result.get("starts_at")
     if not is_test and starts_at_str:
         starts_dt = parse_iso_datetime(starts_at_str)
         if starts_dt:
             formatted_time = starts_dt.strftime("%B %d, %Y at %I:%M %p (PHT)")
             if starts_dt > now_manila:
+                announced = True
                 header_content = (
                     f"🚨 {MENTION} **ADVANCE BOOKING ANNOUNCED!**"
                     if MENTION
@@ -1413,6 +1558,24 @@ def build_discord_payload(result, is_test=False):
                     "inline": False,
                 }
 
+    cinema_field = None
+    if new_cinemas is not None and not is_test:
+        more = f"{len(new_cinemas)} more cinema{'' if len(new_cinemas) == 1 else 's'}"
+        header_content = (
+            f"🚨 {MENTION} **NOW BOOKING AT MORE CINEMAS!**"
+            if MENTION
+            else "🚨 **NOW BOOKING AT MORE CINEMAS!**"
+        )
+        title = f"🎟️ {movie_name} — Now at {more}!"
+        description = (
+            f"Tickets for **{movie_name}** are now also on sale at {more} "
+            "on SM Cinema!\n\nHead over and book your seats before they sell out."
+        )
+        if new_cinemas:
+            cinema_field = {"name": "📍 Now also booking at", "value": format_cinema_links(new_cinemas)}
+    elif not is_test and not announced and result.get("cinemas"):
+        cinema_field = {"name": "📍 Book at", "value": format_cinema_links(result["cinemas"])}
+
     fields = [
         {
             "name": "🎬 Movie",
@@ -1429,12 +1592,18 @@ def build_discord_payload(result, is_test=False):
             "value": f"[Click here to book]({MOVIE_URL})",
             "inline": False,
         },
+    ]
+
+    if cinema_field:
+        fields.append(dict(cinema_field, inline=False))
+
+    fields.append(
         {
             "name": "⏰ Detected At",
             "value": timestamp,
             "inline": False,
-        },
-    ]
+        }
+    )
 
     if timing_field:
         fields.append(timing_field)
@@ -1481,6 +1650,16 @@ SIMULATED_PHASES = ("announced", "open")
 
 SIMULATED_SIGNAL = "SIMULATED ALERT (--simulate-alert) — not a real detection"
 
+# Stands in for the swept cinemas so a preview shows the "Book at" field that
+# real alerts carry. Its name owns up to being fake, as the signals line does.
+SIMULATED_CINEMA = {
+    "id": "0000",
+    "name": "Example Cinema (simulated)",
+    "url": "https://www.smcinema.com/sites",
+    "sessions": 3,
+    "first_date": None,
+}
+
 
 def build_simulated_result(phase, film_title=None, now=None):
     """
@@ -1521,6 +1700,8 @@ def build_simulated_result(phase, film_title=None, now=None):
         "starts_at": starts_at_iso,
         "film_title": film_title,
         "film_id": extract_film_id(MOVIE_URL),
+        "cinemas": [dict(SIMULATED_CINEMA)],
+        "sweep_error": None,
     }
 
 
@@ -1632,13 +1813,13 @@ def verify_webhook(url=None, session=None):
     return False
 
 
-def send_discord_notification(result, is_test=False):
+def send_discord_notification(result, is_test=False, new_cinemas=None):
     """Send a formatted Discord embed notification via Webhook."""
     if not WEBHOOK_URL:
         print("[WARN] No DISCORD_WEBHOOK_URL set. Notification cannot be sent.")
         return False
 
-    payload = build_discord_payload(result, is_test=is_test)
+    payload = build_discord_payload(result, is_test=is_test, new_cinemas=new_cinemas)
 
     starts_at_str = result.get("startsAt") or result.get("starts_at")
     if starts_at_str:
@@ -1828,13 +2009,19 @@ def main(argv=None):
                   f"Resetting notification phase for the new film.")
             old_state = dict(old_state)
             old_state["notify_phase"] = "none"
+            old_state["alerted_sites"] = None
             state["notify_phase"] = "none"
+            state["alerted_sites"] = None
             previous_status = "unavailable"
 
     if status == "AVAILABLE":
         state["last_status"] = "available"
         stored_phase = old_state.get("notify_phase", "none")
         current_phase = determine_booking_phase(result)
+        # Where to book right now. None means the sweep could not run, which is
+        # "unknown", not "nowhere", so cinema tracking then leaves state alone.
+        cinemas = result.get("cinemas")
+        alerted = old_state.get("alerted_sites")
 
         should_notify = (
             (stored_phase == "none" and current_phase in ("announced", "open"))
@@ -1861,6 +2048,27 @@ def main(argv=None):
             # webhook is later fixed. A failed send must stay retryable.
             if notified:
                 state["notify_phase"] = current_phase
+                # That alert just named every cinema selling right now.
+                if current_phase == "open" and cinemas is not None:
+                    state["alerted_sites"] = sorted(set(alerted or []) | {c["id"] for c in cinemas})
+        elif current_phase == "open" and cinemas is not None:
+            # No record yet counts as nothing announced. Assuming the earlier
+            # alert covered every cinema selling now would silently swallow any
+            # that started selling since: SM Mall of Asia did exactly that the
+            # day this tracking was written. A repeat beats a missed cinema.
+            #
+            # Only on a known count of sessions with seats: an unknown count
+            # means no seat data came back at all, which is no proof of a sale.
+            new_cinemas = [c for c in cinemas if c["id"] not in (alerted or []) and c.get("sessions")]
+            if new_cinemas:
+                names = ", ".join(c["name"] for c in new_cinemas)
+                print(f"\n[ACTION] 🎉 Now also booking at {names}! Sending notification...")
+                # Same rule as the phase: record a cinema only once its alert
+                # has landed, so a failed send stays retryable.
+                if send_discord_notification(result, new_cinemas=new_cinemas):
+                    state["alerted_sites"] = sorted(set(alerted or []) | {c["id"] for c in new_cinemas})
+            else:
+                print("\n[ACTION] Tickets available (open), and every cinema selling has been announced. Skipping.")
         else:
             print(f"\n[ACTION] Tickets available ({current_phase}), but notification already sent ({stored_phase}). Skipping.")
     else:  # UNAVAILABLE
@@ -1869,6 +2077,7 @@ def main(argv=None):
         # Only reset notify_phase if tickets were PREVIOUSLY confirmed available and have now disappeared
         if old_state.get("notify_phase") != "none" and previous_status == "available":
             state["notify_phase"] = "none"
+            state["alerted_sites"] = None
             print("[STATE] Reset notify_phase: Tickets were previously available but are now confirmed unavailable.")
 
     # 3. Only persist state to disk if state actually changed
@@ -1876,11 +2085,22 @@ def main(argv=None):
         state.get("notify_phase") != old_state.get("notify_phase")
         or state.get("last_status") != old_state.get("last_status")
         or state.get("film_id") != old_state.get("film_id")
+        or state.get("alerted_sites") != old_state.get("alerted_sites")
     ):
         save_state(state)
         print(f"\n[STATE] Meaningful state change detected. Saved to {STATE_FILE}: {state}")
     else:
         print(f"\n[STATE] No state change ({state.get('last_status')}, notify_phase={state.get('notify_phase')}). Zero file modifications.")
+
+    # The categories carried this run, but a sweep broken for good means a
+    # cinema that starts selling can no longer be noticed. Now that state is
+    # saved, fail the run like any other hard failure.
+    sweep_error = result.get("sweep_error")
+    if sweep_error and sweep_error.get("hard"):
+        print(f"[ACTION] Session sweep failed hard ({sweep_error.get('error_reason')}) — "
+              "exiting non-zero so this run shows as failed.")
+        print(f"\n{'='*60}\n")
+        sys.exit(1)
 
     print(f"\n{'='*60}\n")
 

@@ -1,5 +1,9 @@
 {
   "notify_phase": "open",
   "last_status": "available",
-  "film_id": "HO00001619"
+  "film_id": "HO00001619",
+  "alerted_sites": [
+    "2007",
+    "2102"
+  ]
 }

@@ -8,11 +8,12 @@ An automated ticket availability monitor for **Avengers: Doomsday** at **SM Cine
 
 - **Automated Monitoring:** Checks every 5 minutes, from a loop inside a long-running GitHub Actions job rather than from the cron itself — see [Why the cron is only a starter](#-why-the-cron-is-only-a-starter).
 - **Direct JSON API First:** Directly queries SM Cinema's internal backend (`digital-api.smcinema.com/ocapi/v1/films/<ID>/availability`) using the JWT `gasToken` extracted from the page's Next.js SSR hydration data (`__NEXT_DATA__`). Completes in a few seconds with minimal bandwidth and zero browser footprint.
-- **Session Sweep:** While the film is still categorised `ComingSoon`, every cinema is checked for real sessions — SM Cinema can put tickets on sale without changing the category. See [Why categories are not enough](#why-categories-are-not-enough).
+- **Session Sweep:** Every check looks for real sessions at every cinema — SM Cinema can put tickets on sale without changing the category. See [Why categories are not enough](#why-categories-are-not-enough).
+- **Cinema Links & New-Cinema Alerts:** Alerts link each cinema you can book at. A cinema that starts selling after the first alert gets an alert of its own, naming just that cinema.
 - **Opt-In Browser Fallback:** Retains the full Playwright headless browser implementation (with bot-evasion masks) via `USE_BROWSER_FALLBACK=1` and a manual `check-browser.yml` workflow.
 - **Robust Error Classification:** Soft errors (network timeouts, Cloudflare 403/429 rate limits, 5xx server errors) are automatically retried with exponential backoff. Hard errors (404 Not Found, auth rejection, schema drift) fail loudly to trigger GitHub alert notifications.
 - **Scoped Signal Matching & Interim Decision Rules:** Evaluates film availability categories, advance booking periods, and showtimes with conservative defaults biased toward alerting.
-- **Two-Phase Alert System & Duplicate Prevention:** Alert phase is tracked in `state.json` (`"notify_phase": "none" | "announced" | "open"`). If an advance booking announcement was already sent in the past, an "open now" notification still fires the moment booking seats become live. State is committed back to the repository **only when the phase or status actually changes** — routine checks write nothing.
+- **Two-Phase Alert System & Duplicate Prevention:** Alert phase is tracked in `state.json` (`"notify_phase": "none" | "announced" | "open"`). If an advance booking announcement was already sent in the past, an "open now" notification still fires the moment booking seats become live. State is committed back to the repository **only when the phase, status or announced cinemas actually change** — routine checks write nothing.
 - **Schedule Keepalive:** A monthly empty commit stops GitHub from auto-disabling the cron after 60 days of repository inactivity.
 - **Zero Cost:** 100% free with no credit card required.
 
@@ -147,9 +148,10 @@ Run the **Simulate Ticket Alert** workflow (Actions tab → *Simulate Ticket Ale
 | `mention: false` | Blanks `MENTION` for that run only: identical embed, nobody pinged. |
 
 The simulation renders through the same `build_discord_payload()` as a genuine
-detection, so what you see is what you will get. The one deliberate tell is the
+detection, so what you see is what you will get. The deliberate tells are the
 **Signals Detected** field, which always reads
-`SIMULATED ALERT (--simulate-alert) — not a real detection`.
+`SIMULATED ALERT (--simulate-alert) — not a real detection`, and the single
+`Example Cinema (simulated)` listed under **Book at**.
 
 It is safe to run at any time. The workflow declares `contents: read`, and
 `--simulate-alert` never loads or writes `state.json` — so a preview cannot
@@ -303,15 +305,21 @@ python checker.py
 | Missing `filmAvailability`, unrecognised shape, or 401/403/404 | `ERROR` (hard) — run fails, state untouched |
 | Network timeout, Cloudflare 403/429, or 5xx server error | `ERROR` (soft) — auto-retried up to 3 times with backoff |
 
-### Session Sweep (only while categories say `ComingSoon`)
+### Session Sweep (every check)
+While the categories say only `ComingSoon`, the sweep decides:
+
 | Situation | Result |
 |---|---|
-| Any session at any cinema still has seats | `AVAILABLE` (open now) — the alert names the cinemas and first date |
+| Any session at any cinema still has seats | `AVAILABLE` (open now) — the alert links each cinema with seats |
 | Sessions exist, but every one is sold out | `UNAVAILABLE` — nothing to buy, so the alert is saved for when seats appear |
 | No sessions at any cinema | `UNAVAILABLE` |
-| Screenings listed, but no seat data returned | `AVAILABLE` (bias toward alerting) |
+| Screenings listed, but no seat data returned for any cinema | `AVAILABLE` (bias toward alerting) |
 | A sweep request is refused (4xx), or its response changes shape | `ERROR` (hard) — the `detail` from the API is logged |
 | A sweep request times out, is throttled (429), or gets a 5xx | `ERROR` (soft) — retried with the rest of the check |
+
+Once the categories already say available, the sweep only adds where to book. If it
+fails then, the alert still goes out, just without cinema links; a hard sweep failure
+fails the run afterwards, because new cinemas could no longer be noticed.
 
 #### Why categories are not enough
 Avengers: Doomsday (Infinity Vision) went on sale at SM Megamall, SM City Fairview
@@ -324,7 +332,12 @@ The sweep asks the questions the film page asks, but for every cinema:
 `/sites`, then `/film-screening-dates` to see where and when the film plays, then
 `/showtimes/availability` for seats at just those cinemas. Both showtime endpoints
 refuse more than five cinemas per request, so all ~78 cinemas take 16 batched calls.
-None of this runs once the categories themselves say the film is available.
+Seat records carry no cinema ID, so they are placed by their showtime ID, which starts
+with it (`2022-36756` is SM Mall of Asia's); if that ever stops holding, the bot asks
+one cinema at a time instead of guessing.
+
+Cinema links point at the cinema's page, `https://www.smcinema.com/sites/<Name>/<ID>`,
+built the same way as the site's own links.
 
 ### Fallback: Headless Browser (`USE_BROWSER_FALLBACK=1`)
 | Situation | Result |
@@ -353,8 +366,10 @@ previous film's `"open"` phase and silently swallow the alert. `film_id` is adde
 - `announced` → `open`: Advance booking time has arrived (`startsAt` in past/now) → sends "Tickets open now!" alert.
 - `none` → `open`: Tickets released straight to sale without advance announcement → sends "Tickets open now!" alert.
 - `announced` → `announced` or `open` → `open`: No repeated alerts for the same phase.
+- While `open`: a cinema that starts selling gets a "Now booking at more cinemas" alert naming just the new cinemas. `alerted_sites` records every cinema announced so far, so each is announced once — even if it sells out and reopens.
 - `ERROR` never resets the notification phase and never writes state, so a temporary network failure cannot cause duplicate alerts.
-- Confirmed `UNAVAILABLE` resets `notify_phase` to `none` only if tickets were previously confirmed available.
+- Confirmed `UNAVAILABLE` resets `notify_phase` to `none` only if tickets were previously confirmed available, and clears `alerted_sites` with it.
+- No `alerted_sites` yet counts as nothing announced, so the next check announces every cinema selling. Assuming an earlier alert covered them all would silently swallow any cinema that started selling since — SM Mall of Asia did just that the day this was written.
 
 ---
 
