@@ -1,10 +1,17 @@
 {
-  "notify_phase": "open",
-  "last_status": "available",
-  "film_id": "HO00001619",
-  "alerted_sites": [
-    "2007",
-    "2022",
-    "2102"
-  ]
+  "films": {
+    "HO00001619": {
+      "notify_phase": "open",
+      "last_status": "available",
+      "alerted_sites": [
+        "2007",
+        "2022",
+        "2102"
+      ]
+    },
+    "HO00001698": {
+      "notify_phase": "announced",
+      "last_status": "available"
+    }
+  }
 }
